@@ -32,8 +32,8 @@ def parse_args():
             "Compare KS competition v0/v1 Python files. The v0 file must define "
             "Model/get_init_inputs/get_inputs, and the v1 file must define "
             "ModelNew/get_init_inputs/get_inputs. All tensors and models must be on the same device! "
-            "For example: python benchmarks/ks/auto_bench.py --v0_file dlblas/kernels/ks_competition/torch/layer_norm.py "
-            "--v1_file dlblas/kernels/ks_competition/triton/layer_norm.py "
+            "For example: python benchmarks/ks/auto_bench.py --v0_file baseline/sinkhorn.py "
+            "--v1_file optimized/sinkhorn.py "
         )
     )
     parser.add_argument("--v0_file", type=Path, help="Path to the v0 .py file.")
