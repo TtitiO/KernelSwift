@@ -1,0 +1,4 @@
+interface:
+  display_name: "KernelSwift A2 Kernel Development"
+  short_description: "Route C-like and tile DSL kernels for Ascend 910B"
+  default_prompt: "Use $kernelswift-a2-kernel-dev to design, implement, and validate a KernelSwift operator on Ascend 910B."
