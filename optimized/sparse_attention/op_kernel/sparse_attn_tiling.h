@@ -42,6 +42,31 @@ struct FusedQKSoftmaxTiling {
 };
 
 // ---------------------------------------------------------------------------
+// KV transpose kernel tiling.  One work item is one batch.
+// ---------------------------------------------------------------------------
+struct TransposeKvTiling {
+    int32_t batchNum;  // B
+    int32_t n;         // N (kv entries)
+    int32_t d;         // D (head dim)
+};
+
+// ---------------------------------------------------------------------------
+// Basic-API fused sparse-attention megakernel tiling.
+// First version: blockDim=1, AIC and AIV0 process all tiles sequentially.
+// ---------------------------------------------------------------------------
+struct FusedSparseAttnBasicTiling {
+    int32_t totalTiles;  // B*M/4
+    int32_t batchNum;    // B
+    int32_t mPerBatch;   // M
+    int32_t h;           // H
+    int32_t n;           // N
+    int32_t d;           // D
+    int32_t topk;        // K
+    float   scale;       // softmax scale
+    int32_t reserved0;
+};
+
+// ---------------------------------------------------------------------------
 // Cube matmul tiling (QK and PV).  One work item is one (b, mTile) tile.
 // grid = batchNum * totalBlock; blockNum = min(grid, cubeCores); each block
 // loops over workPerBlock consecutive tiles.

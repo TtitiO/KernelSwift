@@ -21,6 +21,14 @@ at::Tensor sparse_attn_fused_qk_softmax(const at::Tensor &q, const at::Tensor &k
                                         const at::Tensor &topk_idxs,
                                         double softmax_scale);
 
+at::Tensor sparse_attn_transpose_kv_torch(const at::Tensor &kv);
+
+at::Tensor sparse_attn_megakernel_basic_torch(const at::Tensor &q,
+                                             const at::Tensor &kv,
+                                             const at::Tensor &attn_sink,
+                                             const at::Tensor &topk_idxs,
+                                             double softmax_scale);
+
 } // namespace ascend_kernel
 
 #endif // OPS_H

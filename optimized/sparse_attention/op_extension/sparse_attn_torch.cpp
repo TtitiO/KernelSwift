@@ -20,6 +20,12 @@ void fused_qk_softmax_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream
                              uint8_t *q, uint8_t *kv, uint8_t *sink,
                              uint8_t *topk, uint8_t *scores, uint8_t *agg,
                              uint8_t *workspace, uint8_t *tiling);
+void transpose_kv_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                         uint8_t *kv, uint8_t *kvT, uint8_t *tiling);
+void fused_sparse_attn_basic_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                                    uint8_t *q, uint8_t *kv, uint8_t *kvT,
+                                    uint8_t *sink, uint8_t *topk, uint8_t *scores,
+                                    uint8_t *agg, uint8_t *out, uint8_t *tiling);
 
 namespace ascend_kernel {
 
@@ -188,6 +194,29 @@ static void computeFusedQKSoftmaxTiling(FusedQKSoftmaxTiling &t,
     t.topk = static_cast<int32_t>(K);
     t.scale = static_cast<float>(softmaxScale);
     t.blockNum = blockNum;
+}
+
+static void computeTransposeKvTiling(TransposeKvTiling &t, int64_t B, int64_t N, int64_t D)
+{
+    t.batchNum = static_cast<int32_t>(B);
+    t.n = static_cast<int32_t>(N);
+    t.d = static_cast<int32_t>(D);
+}
+
+static void computeFusedSparseAttnBasicTiling(FusedSparseAttnBasicTiling &t,
+                                              int64_t B, int64_t M, int64_t H,
+                                              int64_t N, int64_t D, int64_t K,
+                                              double softmaxScale)
+{
+    t.totalTiles = static_cast<int32_t>(B * M / 4);
+    t.batchNum = static_cast<int32_t>(B);
+    t.mPerBatch = static_cast<int32_t>(M);
+    t.h = static_cast<int32_t>(H);
+    t.n = static_cast<int32_t>(N);
+    t.d = static_cast<int32_t>(D);
+    t.topk = static_cast<int32_t>(K);
+    t.scale = static_cast<float>(softmaxScale);
+    t.reserved0 = 0;
 }
 
 static at::Tensor makeTilingTensor(const void *data, size_t bytes, const at::Tensor &ref)
@@ -359,6 +388,92 @@ at::Tensor sparse_attn_fused_qk_softmax(const at::Tensor &q, const at::Tensor &k
         reinterpret_cast<uint8_t *>(ws.mutable_data_ptr()),
         reinterpret_cast<uint8_t *>(tt.mutable_data_ptr()));
     return agg;
+}
+
+at::Tensor sparse_attn_megakernel_basic_torch(const at::Tensor &q,
+                                              const at::Tensor &kv,
+                                              const at::Tensor &attn_sink,
+                                              const at::Tensor &topk_idxs,
+                                              double softmax_scale)
+{
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "q must be bfloat16");
+    TORCH_CHECK(kv.scalar_type() == at::kBFloat16, "kv must be bfloat16");
+    TORCH_CHECK(attn_sink.scalar_type() == at::kFloat, "attn_sink must be float32");
+    TORCH_CHECK(topk_idxs.scalar_type() == at::kInt, "topk_idxs must be int32");
+    TORCH_CHECK(q.is_privateuseone(), "q must be on NPU");
+    TORCH_CHECK(kv.is_privateuseone(), "kv must be on NPU");
+    TORCH_CHECK(attn_sink.is_privateuseone(), "attn_sink must be on NPU");
+    TORCH_CHECK(topk_idxs.is_privateuseone(), "topk_idxs must be on NPU");
+    TORCH_CHECK(q.is_contiguous() && kv.is_contiguous() &&
+                attn_sink.is_contiguous() && topk_idxs.is_contiguous(),
+                "inputs must be contiguous");
+
+    TORCH_CHECK(q.dim() == 4, "q must be [b, m, h, d]");
+    TORCH_CHECK(kv.dim() == 3, "kv must be [b, n, d]");
+    TORCH_CHECK(attn_sink.dim() == 1, "attn_sink must be [h]");
+    TORCH_CHECK(topk_idxs.dim() == 3, "topk_idxs must be [b, m, topk]");
+
+    const int64_t B = q.size(0);
+    const int64_t M = q.size(1);
+    const int64_t H = q.size(2);
+    const int64_t D = q.size(3);
+    const int64_t N = kv.size(1);
+    const int64_t K = topk_idxs.size(2);
+
+    TORCH_CHECK(kv.size(0) == B && kv.size(2) == D, "kv shape mismatch");
+    TORCH_CHECK(attn_sink.size(0) == H, "attn_sink shape mismatch");
+    TORCH_CHECK(topk_idxs.size(0) == B && topk_idxs.size(1) == M, "topk_idxs shape mismatch");
+
+    at::Tensor kvT = at::empty({B, D, N}, kv.options());
+    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kHalf));
+    at::Tensor agg = at::empty({B, M, H, N}, q.options().dtype(at::kBFloat16));
+    at::Tensor out = at::empty({B, M, H, D}, q.options());
+
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
+
+    TransposeKvTiling kvTiling{};
+    computeTransposeKvTiling(kvTiling, B, N, D);
+    at::Tensor kvTilingT = makeTilingTensor(&kvTiling, sizeof(kvTiling), kv);
+    transpose_kv_kernel((uint32_t)kvTiling.batchNum, nullptr, aclStream,
+        reinterpret_cast<uint8_t *>(kv.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(kvT.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(kvTilingT.mutable_data_ptr()));
+
+    FusedSparseAttnBasicTiling tiling{};
+    computeFusedSparseAttnBasicTiling(tiling, B, M, H, N, D, K, softmax_scale);
+    at::Tensor tilingT = makeTilingTensor(&tiling, sizeof(tiling), q);
+    fused_sparse_attn_basic_kernel(1U, nullptr, aclStream,
+        reinterpret_cast<uint8_t *>(q.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(kv.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(kvT.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(attn_sink.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(topk_idxs.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(scores.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(agg.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(out.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(tilingT.mutable_data_ptr()));
+
+    return out;
+}
+
+at::Tensor sparse_attn_transpose_kv_torch(const at::Tensor &kv)
+{
+    TORCH_CHECK(kv.scalar_type() == at::kBFloat16, "kv must be bfloat16");
+    TORCH_CHECK(kv.is_privateuseone(), "kv must be on NPU");
+    TORCH_CHECK(kv.dim() == 3, "kv must be [b, n, d]");
+    const int64_t B = kv.size(0);
+    const int64_t N = kv.size(1);
+    const int64_t D = kv.size(2);
+    at::Tensor kvT = at::empty({B, D, N}, kv.options());
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
+    TransposeKvTiling t{};
+    computeTransposeKvTiling(t, B, N, D);
+    at::Tensor tt = makeTilingTensor(&t, sizeof(t), kv);
+    transpose_kv_kernel((uint32_t)t.batchNum, nullptr, aclStream,
+        reinterpret_cast<uint8_t *>(kv.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(kvT.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(tt.mutable_data_ptr()));
+    return kvT;
 }
 
 } // namespace ascend_kernel

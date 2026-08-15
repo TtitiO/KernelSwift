@@ -124,10 +124,32 @@ Interpretation:
   or by the AIV→AIC `agg` data path; control (7) isolates the hang to the
   second-object / retarget call itself.
 - Therefore a full single-launch QK+softmax+PV megakernel is blocked by this
-  KFC limitation unless the cube work is rewritten with the raw `Mmad` / fixpipe
-  API instead of the high-level KFC `Matmul` objects, or the CANN KFC bug is
-  fixed.  The shipped kernel keeps the two-stage form: fused QK+softmax
-  megakernel + separate PV cube kernel.
+  KFC limitation **if using the high-level `Matmul` objects**; the shipped
+  kernel keeps the two-stage form for that path.
+
+### Basic-API (`Mmad`) full megakernel — works
+
+A raw-Ascend-C full megakernel was then implemented and validated on
+`dav_2201` (CANN 8.5.2):
+
+- `op_kernel/transpose_kv_kernel.asc` — vector kernel that writes `kvT[B,D,N]`
+  from `kv[B,N,D]` (QK needs B as `[D,N]`; PV uses `kv` directly).
+- `op_kernel/fused_sparse_attn_basic_kernel.asc` — one `__mix__(1,2)` launch:
+  AIC runs `CopyIn (DataCopy/Nd2Nz) -> SplitA/SplitB (LoadData) -> Compute
+  (Mmad) -> CopyOut (Fixpipe)` for both QK and PV; AIV0 runs the sink-aware
+  sparse softmax; AIV1 participates in the cross-core flag handshake.
+- Synchronization uses `CrossCoreSetFlag<2, PIPE_FIX>` (AIC→AIV) and
+  `CrossCoreSetFlag<2, PIPE_MTE3>` (AIV→AIC) with matching default waits.
+  Empirically, **both AIV sub-blocks must consume and return the flags** — an
+  early-returning AIV1 hangs the AIC wait, so AIV1 runs the handshake while
+  only AIV0 writes `agg`.
+
+Verified on the official shape `B=8, M=2600, H=64, D=128, N=32, K=16`:
+`max_abs_diff ≈ 0.0156` (same one-BF16-ULP level as the shipped kernel) and a
+single launch completes in ≈ 49.8 ms.  The current basic-API version is a
+single-AI-core serialized proof of correctness (blockDim=1) and is slower than
+the shipped two-stage kernel; the next optimization step is multi-core tile
+partitioning plus QK/softmax/PV software pipelining on the raw `Mmad` path.
 
 Other empirically established facts (CANN 8.5.2 `dav_2201`): a mixed kernel is
 declared `__global__ __mix__(1, 2)` (`__attribute__((core_ratio(1,2)))`); with
