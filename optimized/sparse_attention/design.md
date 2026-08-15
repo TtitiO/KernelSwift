@@ -97,17 +97,37 @@ message routing / fixpipe-wait protocol for the second cube object never
 replies), so the PV was kept as the separate batched `MatmulImpl` kernel.  The
 remaining ~170 MB agg round-trip is worth ≈ 0.12 ms (→ ~5.9x if fused).
 
-Additional megakernel experiments (CANN 8.5.2 `dav_2201`) confirmed the KFC
-limitation is not shape- or dtype-specific:
-- a second KFC `Matmul` object with the **same QK tiling** and C=FP16 still
-  hangs on its first `IterateAll`;
-- reusing the **same** KFC `Matmul` object for a second `IterateAll` with
-  `SetSingleShape(256, 128, 32)` (after QK `SetSingleShape(256, 32, 128)`)
-  also hangs, so the KFC client/server cannot be retargeted to the PV shape at
-  runtime either.
-A full single-launch QK+softmax+PV megakernel therefore remains blocked by this
-CANN KFC bug; the shipped kernel is a two-stage fused QK+softmax megakernel +
-separate PV cube kernel.
+### Megakernel attempt matrix (all on CANN 8.5.2 `dav_2201`)
+
+A full megakernel here means one `__mix__(1,2)` launch that runs QK GEMM,
+sparse softmax, and PV GEMM on the same cube, so the `agg` intermediate never
+leaves L2 and the PV kernel launch disappears.  Expected gain from the removed
+launch + L2-resident `agg` is ≈ 0.12 ms (→ ≈ 5.9x).  Each variant below was
+compiled with Ascend C and run on the huawei server; "hang" means the AIV never
+returns from `IterateAll`/`WaitIterateAll` and the host call times out.
+
+| # | Configuration | Result |
+|---|---------------|--------|
+| 1 | Two KFC `Matmul` objects (`qkMm`, `pvMm`); PV C=BF16, sync `IterateAll` | **hang** in PV `IterateAll` |
+| 2 | Same as (1), but PV C=BF16, async `IterateAll<false>` + `WaitIterateAll` | **hang** in `WaitIterateAll` |
+| 3 | Same as (1), but PV C=FP16 (write half, cast after launch) | **hang** in PV `IterateAll` |
+| 4 | Second object forced to the **same QK tiling** (`256×32×128`, C=FP16) | **hang** on its first `IterateAll` |
+| 5 | Single KFC object re-used for PV: after QK, `SetSingleShape(256, 128, 32)` | **hang** in the retargeted `IterateAll` |
+| 6 | Single KFC object initialized with max dims `(256, 128, 128)`, then QK `SetSingleShape(256, 32, 128)` and PV `SetSingleShape(256, 128, 32)` | **hang** in the retargeted PV `IterateAll` |
+| 7 | Control: single KFC object, QK-only loop with unified tiling, no PV loop | returns correctly |
+
+Interpretation:
+- The KFC high-level `Matmul` path on this CANN version can drive **one** cube
+  object repeatedly at **one** tiled shape, but it cannot drive a second object
+  and cannot be retargeted to a different `N`/`K` at runtime.
+- The failure is not caused by dtype (BF16 vs FP16 C), by the PV tiling shape,
+  or by the AIV→AIC `agg` data path; control (7) isolates the hang to the
+  second-object / retarget call itself.
+- Therefore a full single-launch QK+softmax+PV megakernel is blocked by this
+  KFC limitation unless the cube work is rewritten with the raw `Mmad` / fixpipe
+  API instead of the high-level KFC `Matmul` objects, or the CANN KFC bug is
+  fixed.  The shipped kernel keeps the two-stage form: fused QK+softmax
+  megakernel + separate PV cube kernel.
 
 Other empirically established facts (CANN 8.5.2 `dav_2201`): a mixed kernel is
 declared `__global__ __mix__(1, 2)` (`__attribute__((core_ratio(1,2)))`); with
