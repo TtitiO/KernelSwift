@@ -216,6 +216,9 @@ static void computeFusedSparseAttnBasicTiling(FusedSparseAttnBasicTiling &t,
     t.d = static_cast<int32_t>(D);
     t.topk = static_cast<int32_t>(K);
     t.scale = static_cast<float>(softmaxScale);
+    const int32_t cubeCores = getCubeCoreNum();
+    t.blockNum = (cubeCores < t.totalTiles) ? cubeCores : t.totalTiles;
+    if (t.blockNum < 1) t.blockNum = 1;
     t.reserved0 = 0;
 }
 
@@ -442,7 +445,7 @@ at::Tensor sparse_attn_megakernel_basic_torch(const at::Tensor &q,
     FusedSparseAttnBasicTiling tiling{};
     computeFusedSparseAttnBasicTiling(tiling, B, M, H, N, D, K, softmax_scale);
     at::Tensor tilingT = makeTilingTensor(&tiling, sizeof(tiling), q);
-    fused_sparse_attn_basic_kernel(1U, nullptr, aclStream,
+    fused_sparse_attn_basic_kernel((uint32_t)tiling.blockNum, nullptr, aclStream,
         reinterpret_cast<uint8_t *>(q.mutable_data_ptr()),
         reinterpret_cast<uint8_t *>(kv.mutable_data_ptr()),
         reinterpret_cast<uint8_t *>(kvT.mutable_data_ptr()),

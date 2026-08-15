@@ -63,6 +63,7 @@ struct FusedSparseAttnBasicTiling {
     int32_t d;           // D
     int32_t topk;        // K
     float   scale;       // softmax scale
+    int32_t blockNum;    // AI cores launched (<= cubeCores)
     int32_t reserved0;
 };
 

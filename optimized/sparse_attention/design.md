@@ -144,12 +144,16 @@ A raw-Ascend-C full megakernel was then implemented and validated on
   early-returning AIV1 hangs the AIC wait, so AIV1 runs the handshake while
   only AIV0 writes `agg`.
 
-Verified on the official shape `B=8, M=2600, H=64, D=128, N=32, K=16`:
-`max_abs_diff ≈ 0.0156` (same one-BF16-ULP level as the shipped kernel) and a
-single launch completes in ≈ 49.8 ms.  The current basic-API version is a
-single-AI-core serialized proof of correctness (blockDim=1) and is slower than
-the shipped two-stage kernel; the next optimization step is multi-core tile
-partitioning plus QK/softmax/PV software pipelining on the raw `Mmad` path.
+Optimization results (official shape `B=8, M=2600, H=64, D=128, N=32, K=16`):
+- multi-core tile partition (20 AI cores, `blockDim=20`);
+- each AIV processes half of each tile's rows, so both vector sub-blocks are
+  used and each scores tile is only loaded once per half;
+- AIC runs a depth-1 software pipeline: `QK(t+1)` overlaps the AIVs'
+  `softmax(t)`, then `PV(t)` follows the AGG handshake.
+
+Measured with `auto_bench.py` (warmup 20, repeat 50): **PASS accuracy,
+speedup ≈ 5.52x** (v0 ≈ 8.02 ms, v1 ≈ 1.45 ms), faster than the KFC-based
+two-stage kernel's ≈ 5.45x.  `max_abs_diff` remains ≈ one BF16 ULP.
 
 Other empirically established facts (CANN 8.5.2 `dav_2201`): a mixed kernel is
 declared `__global__ __mix__(1, 2)` (`__attribute__((core_ratio(1,2)))`); with

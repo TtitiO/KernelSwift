@@ -1,15 +1,16 @@
-"""SparseAttention — Ascend C (Cube + Vector) competition submission.
+"""SparseAttention — raw-Mmad full megakernel (single-AI-core proof).
 
-Timed path: `torch.ops.npu.sparse_attn` (the compiled Ascend C kernels loaded
-from `build/libsparse_attn_ops.so`).  No PyTorch matmul/softmax/gather runs on
-the timed path.
+Timed path: `torch.ops.npu.sparse_attn_megakernel_basic`, which launches one
+transpose-kv vector kernel and one `__mix__(1,2)` basic-API kernel that runs
+QK GEMM + sparse softmax + PV GEMM in a single launch.
 """
 
 import os
 
 import torch
 import torch.nn as nn
-import torch_npu  # noqa: F401  (registers the PrivateUse1/npu backend)
+import torch_npu  # noqa: F401
+
 
 _LOADED = [False]
 
@@ -23,7 +24,7 @@ def _get_op():
     return torch.ops.npu.sparse_attn_megakernel_basic
 
 
-def sparse_attention_ascendc(q, kv, attn_sink, topk_idxs, softmax_scale):
+def sparse_attention_megakernel_basic(q, kv, attn_sink, topk_idxs, softmax_scale):
     return _get_op()(q, kv, attn_sink, topk_idxs, float(softmax_scale))
 
 
@@ -36,7 +37,7 @@ class ModelNew(nn.Module):
         self.attn_sink = nn.Parameter(torch.zeros(n_heads, dtype=torch.float32))
 
     def forward(self, q, kv, topk_idxs):
-        return sparse_attention_ascendc(
+        return sparse_attention_megakernel_basic(
             q, kv, self.attn_sink, topk_idxs, self.softmax_scale
         )
 
