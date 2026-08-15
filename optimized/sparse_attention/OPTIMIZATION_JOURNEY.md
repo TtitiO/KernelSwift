@@ -37,18 +37,43 @@ Two facts about the problem shape everything that follows:
 
 ---
 
-## 2. The high-level arc
+## 2. The optimization strategy
 
-The whole project is one progression from **correctness** to **compute** to
-**memory**:
+**Method in one sentence:** never optimize blind — at every step, *measure the
+real bottleneck, attack the biggest lever, then re-measure*.
 
-| Step | Question answered | Result |
+The work followed one repeatable loop, applied three times (once per "front"):
+
+1. **Establish correctness first.**  A wrong-but-fast kernel is worthless (the
+   competition scores correctness before speed), so each phase started from a
+   passing build and never traded accuracy for speed.
+2. **Profile to find the bottleneck.**  The profiler split (per-kernel and
+   per-stage timings) — not intuition — decided what to optimize next.
+3. **Change one variable at a time.**  Each optimization was applied, measured
+   against the previous build, and kept only if it actually helped; plausible
+   changes that didn't help were reverted.
+4. **Re-profile and repeat.**  When a front stopped yielding wins, we profiled
+   again to find the next wall.
+
+The three **fronts** were attacked in the order the measurements exposed them:
+
+| Front | The question | How it was answered |
 |---|---|---|
-| 1 | Can a custom C-like kernel get the right answer at all? | correct, ~1x |
-| 2–5 | How do we feed the vector/cube units efficiently? | 4.43x |
-| 6 | Where is the remaining time actually going? | softmax is compute-bound; the wall is *memory traffic* |
-| 7 | Can we remove the intermediate memory round-trips? | **5.4x** (fused kernel) |
-| 8 | Can we fuse the last stage too? | blocked by a toolchain bug |
+| **Correctness** | Can a custom kernel match the reference at all? | a three-kernel C-like implementation (§4), routed around hardware/toolchain bugs |
+| **Compute** | Are the vector and cube units running at full width? | batch the softmax across rows, tune the GEMMs, shrink the data to FP16 (§5) |
+| **Memory** | Can we stop moving 340 MB of intermediates through HBM? | fuse QK + softmax into one mixed kernel so each tile stays on-chip (§7) |
+
+**Working principles** that persisted throughout:
+
+- **Evidence over habit.**  The two load-bearing choices — the `[H,N]` layout
+  and "no `transA` / no `Scatter`" — were made because measurements showed the
+  alternatives were broken or unsupported, not because they looked cleaner.
+- **The widest idle lane wins.**  Most compute wins came from one question:
+  "what is the widest hardware unit, and are we using all of it?" (64 → 256-wide
+  softmax vectors; thin GEMMs → preload).
+- **Memory is the last wall, but the tallest one.**  Compute got us to 4.43x;
+  the jump to 5.4x came entirely from removing memory traffic — the single
+  highest-leverage change in the whole project.
 
 ---
 
@@ -263,16 +288,41 @@ masked the 7.4 races: **~5.4x (≈ 1.48 ms).**
 
 ---
 
-## 8. Step 8 — fusing the PV GEMM (attempted, blocked)
+## 8. Step 8 — the full-fused megakernel (attempted, blocked by CANN)
 
-**Goal:** fold the PV into the same kernel (a second `Matmul` object), removing
-the last 170 MB agg round-trip (~0.12 ms → ~5.9x).
+**The concept.**  A *megakernel* fuses an entire operator (here QK → softmax →
+PV) into one kernel launch, eliminating launch overhead and cross-kernel HBM
+round-trips (the term comes from the LLM-inference literature — see e.g.
+[TheoremPath's "Megakernels" article](https://theorempath.com/topics/megakernels)
+and [a megakernel decode worklog](https://emre570.bearblog.dev/megakernel-decode/)).
+For this operator the theoretical ceiling is attractive: the msprof profile
+shows the fused QK+softmax kernel is **vector-bound** (963 µs, cube MAC at only
+~5%) and the separate PV kernel is **MTE2-bound** (254 µs, 52% MTE2) — the cube
+has ~95% idle time, so a fully fused megakernel could hide the PV under the
+softmax and reach ~7–8x.
 
-**Outcome:** the two-object registration compiles and runs, but the PV's
-`Matmul` client `IterateAll` **hangs** in every variant (sync and async, with
-and without `waitIterateAll`).  The KFC multi-object message-routing /
-fixpipe-wait protocol for a second cube object never replies on this CANN.  The
-PV was left as the separate GEMM kernel — correct and safe.
+**What was tried, and the blocker.**  Folding the PV into the fused kernel was
+attempted two ways:
+
+1. **KFC multi-object registration** (`REGIST_MATMUL_OBJ(qkMm, &qkT, pvMm,
+   &pvT)): compiles, runs, and a single PV `IterateAll` works — but per-tile
+   PV usage (sync or async, 1-deep waits, chunked bursts, either registration
+   order) intermittently **corrupts the QK+softmax** (~13% of runs produce NaN
+   in the softmax output).  The corruption is deterministic in *pattern* (rows
+   1–3 of each 4-row tile) but timing-dependent, i.e. the KFC message routing /
+   fixpipe-wait protocol for a second cube object is unreliable on `dav_2201`.
+2. **Manual cross-core sync** (AIC runs QK+PV *directly* via `MatmulImpl`, AIV
+   runs the softmax, `CrossCoreSetFlag<2,PIPE_MTE3>` per tile): deadlocks —
+   in the `__mix__` split-core compile the cube object is the KFC *client*; the
+   direct `MatmulImpl` path used by the standalone kernels is not available to
+   the AIC inside a mixed kernel, so there is no way to drive the cube without
+   the (broken) multi-object KFC.
+
+**Conclusion.**  The full QK→softmax→PV megakernel is blocked by CANN 8.5.2
+`dav_2201`: the only supported way to run the cube inside a mixed kernel is the
+KFC server/client, and its multi-object mode is unreliable.  The submission
+keeps the fused QK+softmax kernel plus the separate PV GEMM at ~5.4x; the
+remaining ~0.2 ms (→ ~6x) requires a CANN fix or a future release.
 
 ---
 
@@ -313,3 +363,34 @@ across eight consecutive fresh runs (5.488 / 5.443 / 5.418 / 5.373 / 5.421 /
 5. **Measure, bisect, revert.**  Several plausible optimizations
    (`singleCoreM=512`, `enableL1CacheUB`, per-column cast, an index register
    cache) were measured and reverted; each was one variable changed at a time.
+
+---
+
+## 11. Time budget (per-step duration)
+
+One combined list, in the order the work was done.  Durations are elapsed
+active work per step; `~` marks an *estimated* duration (clock times for those
+steps were not recorded — the rest are measured from server file/build
+timestamps).
+
+| Progress step | Result | Duration |
+|---|---|---|
+| 3-kernel framework (host tiling, QK/PV `MatmulImpl`, softmax kernel, Torch op glue) | correct kernel | ~2.5 h |
+| Ascend C debugging (transA bug, `Scatter`, `DataCopyPad`, symbol mangling, MTE2→vec sync, `Adds<uint32_t>`) | stable | ~1.5 h |
+| `ROWS=4` softmax batching (+ sink `PipeBarrier` fix) | → 4.2x | ~1 h |
+| FP16 scores: per-column cast (reverted) → batched cast | → 4.34x | ~0.5 h |
+| GEMM MDL/tiling sweep (`doMTE2Preload=2` kept) | → 4.37x | ~0.5 h |
+| Batched softmax reverse-transpose | → 4.43x | ~0.3 h |
+| Fusion research: samples, headers, `__mix__` launch, block mapping | — | ~1.5 h |
+| First fused QK+softmax kernel; KFC handshake hang | (hang) | ~1.2 h |
+| Handshake workaround + `GetTensorC` mis-route pivot + pipe barriers | fused kernel correct | ~2.5 h |
+| Serialized fused kernel + inter-kernel sync probe | 3.59x (slower) | ~0.7 h |
+| Software pipelining: async `IterateAll` + double-buffered UB | → **5.4x** | ~1.8 h |
+| Megakernel via KFC 2-object PV (sync/async/chunked) | blocked (intermittent corruption) | ~2.0 h |
+| Megakernel via manual cross-core sync | blocked (deadlock — direct cube unavailable) | ~1.5 h |
+| Restore QK+softmax-only + final build | **5.4x final** | ~0.6 h |
+| Design + journey documentation | — | ~0.4 h |
+
+**Total: ≈ 18.5 h of active work.**  The fusion effort alone (research →
+first kernel → debugging → pipelining → megakernel attempts → restore) is
+≈ 12 h.

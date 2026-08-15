@@ -97,6 +97,18 @@ message routing / fixpipe-wait protocol for the second cube object never
 replies), so the PV was kept as the separate batched `MatmulImpl` kernel.  The
 remaining ~170 MB agg round-trip is worth ≈ 0.12 ms (→ ~5.9x if fused).
 
+Additional megakernel experiments (CANN 8.5.2 `dav_2201`) confirmed the KFC
+limitation is not shape- or dtype-specific:
+- a second KFC `Matmul` object with the **same QK tiling** and C=FP16 still
+  hangs on its first `IterateAll`;
+- reusing the **same** KFC `Matmul` object for a second `IterateAll` with
+  `SetSingleShape(256, 128, 32)` (after QK `SetSingleShape(256, 32, 128)`)
+  also hangs, so the KFC client/server cannot be retargeted to the PV shape at
+  runtime either.
+A full single-launch QK+softmax+PV megakernel therefore remains blocked by this
+CANN KFC bug; the shipped kernel is a two-stage fused QK+softmax megakernel +
+separate PV cube kernel.
+
 Other empirically established facts (CANN 8.5.2 `dav_2201`): a mixed kernel is
 declared `__global__ __mix__(1, 2)` (`__attribute__((core_ratio(1,2)))`); with
 `blockDim=N` it launches `N` AIC + `2N` AIV blocks; vector ops must be guarded

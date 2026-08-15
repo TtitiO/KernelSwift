@@ -1,12 +1,13 @@
 # Ascend A2 kernel DSL and skill landscape
 
-Research snapshot: **2026-08-07**. Re-check upstream compatibility before changing the toolchain.
+Research snapshot: **2026-08-11**. Re-check upstream compatibility before changing the toolchain.
 
 ## Bottom line
 
 - **Ascend C** is the direct C/C++-like programming language for custom Ascend kernels and the primary route for the KernelSwift A2/910B competition goal.
 - **CATLASS** is the closest analogue to **CUTLASS**: a layered C++ template library built on Ascend C. It is especially relevant to matrix-heavy kernels, not a Python DSL.
 - **PTOAS/PTODSL** is the closest current Ascend analogue to **CuTeDSL/cuTile**: explicit, low-level, SPMD tile-oriented Python authoring over PTO. It is promising but still a research/experimental toolchain.
+- **PTO-ISA C++** is a separate C++ header-only tile library and virtual ISA. It exposes `pto/pto-inst.hpp`, tile types/layouts/valid regions, tile instructions, and Auto/Manual placement and synchronization modes. It is C-like source, but its abstraction and generated artifacts must still be distinguished from direct Ascend C.
 - **PyPTO** is a separate, higher-level MPMD Python tile/runtime stack built on PTO-ISA. It is useful for framework-integrated kernels and has a richer CANNBot skill suite, but it is not a C-like source language and should not be presented as a direct Ascend C replacement.
 - **TileLang-Ascend** is a higher-level Python tile DSL with Ascend C/PTO and AscendNPU IR backends. It is a productivity route, not C-like source.
 - **Triton-Ascend** is a Python DSL and already matches much of KernelSwift's current implementation style. It is useful for migration and iteration, but does not satisfy a strict C-like-source requirement.
@@ -17,6 +18,7 @@ Research snapshot: **2026-08-07**. Re-check upstream compatibility before changi
 |---|---|---|---|---|
 | Ascend C | C/C++ syntax and AscendC APIs | Official docs list Atlas A2/A3 and use the A2/A3 architecture target | Highest supported direct control of AIC/AIV, GM/L1/L0/UB, pipelines and events | Primary implementation path |
 | CATLASS | C++ templates over Ascend C | Current CATLASS supports Atlas A2/A3; current mainline requires CANN 8.5.0 and uses architecture `2201` | High, but organized around reusable matrix/epilogue components | GEMM, grouped GEMM, attention, quantization |
+| PTO-ISA C++ | C++ header-only tile library / virtual ISA | Current PTO-ISA advertises Ascend A2/A3/A5 and CPU profiles; A2/A3 profile targets 910B/910C | Explicit tile types, layouts, valid regions, tile placement, synchronization, and pipeline contracts | C-like PTO route; compare against direct Ascend C |
 | PTOAS/PTODSL | Python tracing/JIT to PTO/MLIR/LLVM | PTOAS validation includes `Ascend910B1`; PTO-ISA lists A2 (910B), A3, A5 and CPU simulation | Explicit tile/data-movement control with compiler-managed pipeline opportunities | CuTeDSL-like research route; prototype before adoption |
 | PyPTO | Higher-level Python tensor/tile runtime (MPMD) | CANNBot materials explicitly cover A2/A3 constraints and 910B/910C execution | More framework/runtime abstraction; PTO-ISA remains the low-level primitive | Framework-integrated alternative; use when its runtime contract fits, not for strict C-like source |
 | TileLang-Ascend | Python/TVM tile DSL | Upstream says tested on A2/A3; minimum CANN 8.3.RC1 | Developer and expert modes; explicit L1/L0/UB, Cube/Vector scopes, pipelining and synchronization | Fast experimentation; strong SparseAttention/Indexer examples |
@@ -28,7 +30,7 @@ Research snapshot: **2026-08-07**. Re-check upstream compatibility before changi
 |---|---|---|
 | CUDA C++ | Ascend C | Different execution units, scratchpad hierarchy, compiler and synchronization model |
 | CUTLASS | CATLASS | CATLASS is Ascend-specific and built over Ascend C; APIs/templates are not source-compatible |
-| CuTe C++ layouts/templates | CATLASS tile/layout components and PTO-ISA tiles | No one-to-one layout algebra compatibility |
+| CuTe C++ layouts/templates | CATLASS tile/layout components and PTO-ISA C++ tiles | No one-to-one layout algebra compatibility |
 | CuTeDSL / cuTile | PTOAS/PTODSL | PTOAS uses PTO/MLIR/LLVM and requires the VPTO toolchain; this is the closest low-level analogy |
 | PyTorch/JAX-style NPU runtime | PyPTO | Higher-level MPMD execution and tensor APIs; it still lowers through PTO-ISA but is not SPMD CuTeDSL |
 | TileLang CUDA backend | TileLang-Ascend | Ascend backend maps GPU-like shared/register concepts to L1/UB and L0, with AIC/AIV concerns |
@@ -85,8 +87,8 @@ No maintained, standalone PTOAS-specific public agent skill was found. The proje
 - [CATLASS](https://gitcode.com/cann/catlass), inspected at `0dfcf9df304f297361edab86448ac5ea6aed1647`.
 - [PTO-DSL](https://github.com/huawei-csl/pto-dsl), commit [`b10afbea191dcce6f718d1f1240d5fdc4fca990a`](https://github.com/huawei-csl/pto-dsl/commit/b10afbea191dcce6f718d1f1240d5fdc4fca990a). Its README says future development moved into PTOAS and the standalone repository is maintenance-only.
 - [PTOAS](https://github.com/hw-native-sys/PTOAS), commit [`988d50e245217669a27448c96641bb7eaf26baed`](https://github.com/hw-native-sys/PTOAS/commit/988d50e245217669a27448c96641bb7eaf26baed). It requires the LLVM 21 VPTO branch and includes PTODSL/Python bindings and A2/A3 validation generation for `Ascend910B1`.
-- [PTO-ISA](https://github.com/hw-native-sys/pto-isa), commit [`0cefc9a5a1c24c62655cc345d408559595a8af32`](https://github.com/hw-native-sys/pto-isa/commit/0cefc9a5a1c24c62655cc345d408559595a8af32). It documents 90+ tile instructions, CPU simulation, and A2/A3/A5 support.
-- [PyPTO](https://gitcode.com/cann/pypto): higher-level MPMD framework in the PTO ecosystem; use the vendored CANNBot PyPTO skills with an installed PyPTO devkit and live A2 validation.
+- [PTO-ISA](https://github.com/hw-native-sys/pto-isa), inspected at commit [`40e741bf1cfce99da3b1caa514e08c2f72894922`](https://github.com/hw-native-sys/pto-isa/commit/40e741bf1cfce99da3b1caa514e08c2f72894922). The current source documents 124 tile interfaces, C++ header-only expansion through `pto/pto-inst.hpp`, CPU simulation, and A2/A3/A5 support; its upstream A2/A3 performance tables remain unverified KernelSwift claims.
+- [PyPTO](https://gitcode.com/cann/pypto), inspected at commit [`fad83293ecb575dbe626050467e17cfabdb87278`](https://gitcode.com/cann/pypto/commit/fad83293ecb575dbe626050467e17cfabdb87278): higher-level Python MPMD framework in the PTO ecosystem; the current source declares package version `9.1.0` and documents CANN-version matching. Use the vendored CANNBot PyPTO skills with the installed PyPTO devkit and live A2 validation.
 - [TileLang-Ascend](https://github.com/tile-ai/tilelang-ascend), commit [`272c0ab3928df30f84d7ac644456856366ff60c4`](https://github.com/tile-ai/tilelang-ascend/commit/272c0ab3928df30f84d7ac644456856366ff60c4).
 - [Triton-Ascend](https://github.com/triton-lang/triton-ascend), commit [`77023a376129f7adb0d912de9a46697e48e5c290`](https://github.com/triton-lang/triton-ascend/commit/77023a376129f7adb0d912de9a46697e48e5c290).
 
