@@ -148,8 +148,9 @@ Optimization results (official shape `B=8, M=2600, H=64, D=128, N=32, K=16`):
 - multi-core tile partition (20 AI cores, `blockDim=20`);
 - each AIV processes half of each tile's rows, so both vector sub-blocks are
   used and each scores tile is only loaded once per half;
-- AIC runs a depth-1 software pipeline: `QK(t+1)` overlaps the AIVs'
-  `softmax(t)`, then `PV(t)` follows the AGG handshake.
+- AIC runs a depth-2 QK lookahead pipeline: up to two QK tiles are issued
+  ahead, so `QK(t+2)` overlaps the AIVs' `softmax(t)`, then `PV(t)` follows
+  the AGG handshake.
 
 Measured with `auto_bench.py` (warmup 20, repeat 50): **PASS accuracy,
 speedup ≈ 5.52x** (v0 ≈ 8.02 ms, v1 ≈ 1.45 ms), faster than the KFC-based
