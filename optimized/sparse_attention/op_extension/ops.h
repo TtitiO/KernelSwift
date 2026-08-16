@@ -29,6 +29,12 @@ at::Tensor sparse_attn_megakernel_basic_torch(const at::Tensor &q,
                                              const at::Tensor &topk_idxs,
                                              double softmax_scale);
 
+std::vector<at::Tensor> sparse_attn_megakernel_basic_debug_torch(const at::Tensor &q,
+                                                                  const at::Tensor &kv,
+                                                                  const at::Tensor &attn_sink,
+                                                                  const at::Tensor &topk_idxs,
+                                                                  double softmax_scale);
+
 } // namespace ascend_kernel
 
 #endif // OPS_H

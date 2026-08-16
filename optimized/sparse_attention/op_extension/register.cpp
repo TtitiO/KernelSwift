@@ -16,6 +16,8 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
           "Tensor topk_idxs, float softmax_scale) -> Tensor");
     m.def("sparse_attn_megakernel_basic(Tensor q, Tensor kv, Tensor attn_sink, "
           "Tensor topk_idxs, float softmax_scale) -> Tensor");
+    m.def("sparse_attn_megakernel_basic_debug(Tensor q, Tensor kv, Tensor attn_sink, "
+          "Tensor topk_idxs, float softmax_scale) -> Tensor[]");
     m.def("sparse_attn_transpose_kv(Tensor kv) -> Tensor");
 }
 
@@ -27,6 +29,7 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("sparse_attn_pv", TORCH_FN(ascend_kernel::sparse_attn_pv));
     m.impl("sparse_attn_fused_qk_softmax", TORCH_FN(ascend_kernel::sparse_attn_fused_qk_softmax));
     m.impl("sparse_attn_megakernel_basic", TORCH_FN(ascend_kernel::sparse_attn_megakernel_basic_torch));
+    m.impl("sparse_attn_megakernel_basic_debug", TORCH_FN(ascend_kernel::sparse_attn_megakernel_basic_debug_torch));
     m.impl("sparse_attn_transpose_kv", TORCH_FN(ascend_kernel::sparse_attn_transpose_kv_torch));
 }
 

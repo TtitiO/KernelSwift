@@ -219,6 +219,7 @@ static void computeFusedSparseAttnBasicTiling(FusedSparseAttnBasicTiling &t,
     const int32_t cubeCores = getCubeCoreNum();
     t.blockNum = (cubeCores < t.totalTiles) ? cubeCores : t.totalTiles;
     if (t.blockNum < 1) t.blockNum = 1;
+
     t.reserved0 = 0;
 }
 
@@ -278,7 +279,7 @@ at::Tensor sparse_attn_torch(const at::Tensor &q,
     auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     const int64_t wsSize = 4LL * 1024 * 1024;  // KFC mailbox (oversized for safety)
     at::Tensor ws = at::zeros({wsSize}, q.options().dtype(at::kByte));
-    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kHalf));
+    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kFloat));
     fused_qk_softmax_kernel((uint32_t)fusedTiling.blockNum, nullptr, aclStream,
         reinterpret_cast<uint8_t *>(q.mutable_data_ptr()),
         reinterpret_cast<uint8_t *>(kv.mutable_data_ptr()),
@@ -310,7 +311,7 @@ at::Tensor sparse_attn_qk(const at::Tensor &q, const at::Tensor &kv)
 {
     const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
     const int64_t N = kv.size(1), MH = M * H;
-    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kHalf));
+    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kFloat));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
     SparseMatmulTiling t{};
     computeSparseMatmulTiling(t, MH, N, D, false, true, false, B, MH * D, N * D, MH * N);
@@ -380,7 +381,7 @@ at::Tensor sparse_attn_fused_qk_softmax(const at::Tensor &q, const at::Tensor &k
     auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     const int64_t wsSize = 4LL * 1024 * 1024;  // KFC mailbox (oversized for safety)
     at::Tensor ws = at::zeros({wsSize}, q.options().dtype(at::kByte));
-    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kHalf));
+    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kFloat));
     fused_qk_softmax_kernel((uint32_t)t.blockNum, nullptr, aclStream,
         reinterpret_cast<uint8_t *>(q.mutable_data_ptr()),
         reinterpret_cast<uint8_t *>(kv.mutable_data_ptr()),
@@ -428,7 +429,7 @@ at::Tensor sparse_attn_megakernel_basic_torch(const at::Tensor &q,
     TORCH_CHECK(topk_idxs.size(0) == B && topk_idxs.size(1) == M, "topk_idxs shape mismatch");
 
     at::Tensor kvT = at::empty({B, D, N}, kv.options());
-    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kHalf));
+    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kFloat));
     at::Tensor agg = at::empty({B, M, H, N}, q.options().dtype(at::kBFloat16));
     at::Tensor out = at::empty({B, M, H, D}, q.options());
 
@@ -457,6 +458,36 @@ at::Tensor sparse_attn_megakernel_basic_torch(const at::Tensor &q,
         reinterpret_cast<uint8_t *>(tilingT.mutable_data_ptr()));
 
     return out;
+}
+
+// Debug: same fused megakernel but also return the internal intermediates.
+std::vector<at::Tensor> sparse_attn_megakernel_basic_debug_torch(const at::Tensor &q,
+                                                                  const at::Tensor &kv,
+                                                                  const at::Tensor &attn_sink,
+                                                                  const at::Tensor &topk_idxs,
+                                                                  double softmax_scale)
+{
+    const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
+    const int64_t N = kv.size(1), K = topk_idxs.size(2);
+    at::Tensor kvT = at::empty({B, D, N}, kv.options());
+    at::Tensor scores = at::empty({B, M, H, N}, q.options().dtype(at::kFloat));
+    at::Tensor agg = at::empty({B, M, H, N}, q.options().dtype(at::kBFloat16));
+    at::Tensor out = at::empty({B, M, H, D}, q.options());
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
+    FusedSparseAttnBasicTiling tiling{};
+    computeFusedSparseAttnBasicTiling(tiling, B, M, H, N, D, K, softmax_scale);
+    at::Tensor tilingT = makeTilingTensor(&tiling, sizeof(tiling), q);
+    fused_sparse_attn_basic_kernel((uint32_t)tiling.blockNum, nullptr, aclStream,
+        reinterpret_cast<uint8_t *>(q.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(kv.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(kvT.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(attn_sink.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(topk_idxs.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(scores.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(agg.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(out.mutable_data_ptr()),
+        reinterpret_cast<uint8_t *>(tilingT.mutable_data_ptr()));
+    return {out, agg, scores, kvT};
 }
 
 at::Tensor sparse_attn_transpose_kv_torch(const at::Tensor &kv)

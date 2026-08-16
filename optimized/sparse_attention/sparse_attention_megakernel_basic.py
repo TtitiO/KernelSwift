@@ -1,8 +1,13 @@
-"""SparseAttention — raw-Mmad full megakernel (single-AI-core proof).
+"""SparseAttention — raw-Mmad full megakernel (multi-core, pipelined).
 
 Timed path: `torch.ops.npu.sparse_attn_megakernel_basic`, which launches one
 transpose-kv vector kernel and one `__mix__(1,2)` basic-API kernel that runs
 QK GEMM + sparse softmax + PV GEMM in a single launch.
+
+The fused kernel partitions the 5200 tiles across all 20 AI cores; the AIC
+runs a double-buffered QK/PV cube pipeline while the two AIV sub-blocks per
+core run a ping-pong prefetched, broadcast-batched sink-aware softmax.
+Cross-core flags are batched every 4 tiles (FLAG_BATCH=4).
 """
 
 import os

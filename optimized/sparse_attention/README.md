@@ -1,35 +1,41 @@
 # SparseAttention — Ascend C (Cube + Vector) submission
 
 C-like Ascend C implementation of the SparseAttention task for Huawei Atlas
-A2 (Ascend 910B, `dav-2201`, CANN 8.5.2).  The timed path launches three
-custom Ascend C kernels through a torch op (`npu::sparse_attn`); no PyTorch
-matmul / softmax / gather runs on the timed path.
+A2 (Ascend 910B, `dav-2201`, CANN 8.5.2).  The timed path launches two custom
+Ascend C kernels through a torch op (`npu::sparse_attn_megakernel_basic`):
+a tiny kvT transpose kernel and the **fused QK+softmax+PV megakernel**
+(`__mix__(1,2)`, raw `DataCopy/Nd2Nz + LoadData + Mmad + Fixpipe` basic API).
+No PyTorch matmul / softmax / gather runs on the timed path.
 
 ## Files
 
-- `op_kernel/matmul_kernel.asc` — QK and PV GEMMs (`MatmulImpl`).
-- `op_kernel/sparse_softmax_kernel.asc` — row-batched sink-aware softmax (Vector + `Gather`).
+- `op_kernel/fused_sparse_attn_basic_kernel.asc` — the fused megakernel:
+  QK GEMM + sink-aware sparse softmax + PV GEMM in one launch, partitioned
+  over 20 AI cores with double-buffered cube pipelines, AIV ping-pong
+  prefetch and batched (4-tile) cross-core flags.
+- `op_kernel/transpose_kv_kernel.asc` — kv [B,N,D] -> kvT [B,D,N] prep.
 - `op_kernel/sparse_attn_tiling.h` — host/kernel shared tiling structs.
-- `op_extension/sparse_attn_torch.cpp` — host tiling (`MatmulApiTiling`) + launch.
-- `op_extension/register.cpp` — `npu::sparse_attn` op registration.
+- `op_extension/sparse_attn_torch.cpp` — host tiling + launch.
+- `op_extension/register.cpp` — `npu::sparse_attn_megakernel_basic` op.
 - `sparse_attention.py` — `ModelNew` wrapper (loads the `.so`, calls the op).
 
 ## Algorithm
 
 ```
-scores = q @ kv^T                     (QK GEMM, BF16×BF16 → FP32, batched over b)
-p      = softmax(gather_K(scores), sink)   (row-batched Vector kernel)
-agg    = scatter_N(p)                      ([H,N] layout)
-out    = agg @ kv                     (PV GEMM, BF16×BF16 → BF16, batched over b)
+kvT      = transpose(kv)                     (tiny vector kernel)
+scores   = q @ kvT                           (QK GEMM, BF16xBF16 -> FP32)
+p        = softmax(gather_K(scores), sink)   (AIV, broadcast-batched math)
+agg      = scatter_N(p)                      ([H,N] layout, duplicate-safe)
+out      = agg @ kv                          (PV GEMM, BF16xBF16 -> BF16)
 ```
 
 The softmax runs in the `[H,N]` layout (natural for both GEMMs): the `K`
 selected columns are gathered with the offset-table `Gather` API, the
-sink-aware softmax is batched over 4 rows so the math runs on full-width
-vectors, probabilities are accumulated in an `[N,H]` scratch tile (contiguous
-`Add`, correct for duplicate indices), and the result is transposed back to
-`[H,N]` with a single precomputed-offset BF16 `Gather` (`Scatter` is
-unsupported on `dav_2201`).
+sink-aware softmax is batched over 4 rows on full-width vectors with Brcb
+broadcasts for maxH/reciprocal, probabilities accumulate in `[N,H]` (contig-
+uous `Add`, correct for duplicate indices), and the result is transposed back
+to `[H,N]` with a precomputed-offset BF16 `Gather` (`Scatter` is unsupported
+on `dav_2201`).  See `OPTIMIZATION_JOURNEY.md` for the full story.
 
 ## Build
 
@@ -47,6 +53,6 @@ python benchmarks/ks/auto_bench.py \
   --atol 1e-2 --rtol 1e-2 --warmup 200 --repeat 500
 ```
 
-Measured on `liteserver-4db9` (8× 910B3): **~4.20x** speedup
-(v0 ≈ 8.05 ms, v1 ≈ 1.91 ms), correctness PASS at `atol=rtol=1e-2`
-(`max_abs_diff ≈ 0.016`).
+Measured on `liteserver-4db9` (8x 910B3): **~7.1x** speedup
+(v0 ~= 7.98 ms, v1 ~= 1.12 ms, raw fused-kernel time ~0.91 ms), correctness
+PASS at `atol=rtol=1e-2` (max_abs_diff ~= 0.0156) across multiple seeds.

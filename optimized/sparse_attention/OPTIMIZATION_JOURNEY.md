@@ -394,3 +394,108 @@ timestamps).
 **Total: ≈ 18.5 h of active work.**  The fusion effort alone (research →
 first kernel → debugging → pipelining → megakernel attempts → restore) is
 ≈ 12 h.
+
+---
+
+## 12. Step 9 — the basic-API megakernel (QK+softmax+PV in one launch, multi-core)
+
+After the KFC megakernel attempts were blocked by CANN, the submission moved
+to a **basic-API** fused kernel (`fused_sparse_attn_basic_kernel.asc`) that
+runs the entire operator (QK GEMM → sink-aware softmax → PV GEMM) inside one
+`__mix__(1,2)` launch using raw `DataCopy/Nd2Nz + LoadData + Mmad + Fixpipe`
+instead of the KFC Matmul objects.  This alone took the timed path from
+~1.48 ms to **1.15 ms** (~6.8x).
+
+### 9.1 The four megakernel pillars (already present)
+
+1. **Multi-core tile parallelization** — `blockDim = 20` cube cores; the tile
+   loop is partitioned with `GetBlockIdx()` (260 tiles per core, all cores
+   busy).  The two AIV sub-blocks per core split each tile's 4 m-rows.
+2. **AIC double-buffered pipeline** — depth-2 `A1/B1` queues; `CopyIn(t+1)`
+   is issued before `Compute(t)` so DMA overlaps the cube.
+3. **AIV ping-pong prefetch** — depth-2 `scoresQ_/idxQ_`; tile t+1's scores
+   and indices are loaded while tile t is being consumed.
+4. **Batched cross-core flags** — `FLAG_BATCH=4` tiles per QK/AGG flag
+   handshake instead of one per tile.
+
+### 9.2 AIV vector-pipe reduction (1.15 ms → 0.91 ms, +5x of the remaining)
+
+Profiling showed the kernel is **AIV-issue-bound**: the vector pipe was busy
+~88% of the time with only ~19% actual arithmetic (gathers/casts/moves/SFU
+fill the rest), and every removed vector call was worth ~2.9 us of wall time.
+Attacks, in order (each measured and kept only if correct AND faster):
+
+1. **Hoisted index loads** — `idx.GetValue()` was called 64x per tile per AIV
+   (twice per k); hoisting into a per-row `nk[2][16]` scalar array halved the
+   scalar-UB traffic.  (First attempt with a flat `nk[16]` array was a real
+   bug: the accumulate loop re-read the *last* row's indices — caught by the
+   m%4 pattern in the error map.)
+2. **Max-init + reciprocal-div** — `maxH` initialized from `Max(sink, sK[0])`
+   instead of an `Adds` copy; the 16 `Div`s became 1 `Reciprocal` + 16 `Mul`s.
+3. **Compact per-sub-block sK + batched cast/scale** — the sK tile is laid out
+   `[topk, vecLen]` privately per AIV sub-block, turning 16 per-column
+   `Cast`s + 16 per-column `Muls` into 2 batched calls.
+4. **Per-row transpose table** — the agg transpose `Gather` offset table
+   shrank from 32 KB to 8 KB (row base applied via per-row src/dst pointers),
+   freeing UB for the broadcast scratch.
+5. **Batched softmax chain via Brcb Broadcast** — `maxH` and the reciprocal
+   are fanned out to `[16,128]` with the hardware broadcast, so the 16
+   subtracts / 16 exps / 16 muls became 1 broadcast + 1 batched op each
+   (16 sequential max/add chain ops remain, they are dependency-bound).
+6. **FP32 scores** — the QK fixpipe writes FP32 scores (no `F322F16` quant),
+   so the AIV gathers FP32 directly and the 2048-element half→float cast is
+   gone (perf-neutral vs FP16 but removes one rounding step; kept for
+   precision).  Requires shrinking the over-allocated `sKBuf_`/`maxH2Buf_`
+   (a 32 KB over-allocation pushed the AIV UB past 192 KB and caused an
+   aicore exception — caught by bisection).
+7. **Unified Duplicate** — the two per-row `aggT` zero-fills became one
+   4096-element op (rows are contiguous per sub-block).
+
+### 9.3 Tried and rejected (with evidence)
+
+- **COLUMN_MAJOR fixpipe** (`CFG_COLUMN_MAJOR` L0C→GM) to write the PV output
+  transposed — micro-test showed a scrambled layout on `dav2201`.
+- **`[n][m]` agg scratch + swapped PV GEMM** (kill the transpose gather) —
+  blocked because the cube's `Nd2Nz` `srcNdMatrixStride` is uint16 (max
+  65535) and our batch stride is 166400.
+- **Fusing the kvT transpose into the megakernel** — an AIV→AIC
+  `CrossCoreSetFlag` handshake is fragile on this CANN (flag delivery breaks
+  when one AIV sub-block takes an early-return path; also shape-dependent
+  hangs), and the win was only ~5 us.  Reverted; the standalone 8 us
+  transpose kernel stays.
+- **ROWS=8 tiles** (halve per-tile overhead) — UB budget does not fit.
+- **2D `BlockReduceMax/Sum`** — the k-dim stride is not expressible with the
+  block-stride semantics (rows advance 1 element; the unit is 32 B).
+
+## 13. Final numbers (2026-08-16)
+
+| milestone | latency (raw kernel) | speedup (official bench) |
+|---|---|---|
+| KFC fused QK+softmax + PV (journey end) | 1.48 ms | ~5.4x |
+| basic-API megakernel (4 pillars) | 1.15 ms | ~6.8x |
+| + AIV vector reduction (steps 1-7) | **0.91 ms** | **~7.1x** |
+
+Official `benchmarks/ks/auto_bench.py` (warmup 200, repeat 500, seed 42):
+**PASS accuracy, v0 ≈ 7.98 ms, v1 ≈ 1.12 ms, speedup ≈ 7.06-7.12x** across
+consecutive runs (the bench's per-iteration `set_seed` adds ~0.2 ms to both
+sides).  Raw kernel latency (measured directly): **0.91 ms**, max_abs_diff
+0.0156, allclose PASS for seeds {1,7,42,123,999}.
+
+### 13.1 Double-test re-verification (2026-08-16, post-sync)
+
+Re-built `libsparse_attn_ops.so` from the synced sources and re-ran the
+official bench twice at the README settings (warmup 200, repeat 500,
+seed 42), plus three more seeds at warmup 100 / repeat 200.  All five runs
+PASS accuracy and stay comfortably above the 5x bar:
+
+| run | seed | v0 (ms) | v1 (ms) | speedup | result |
+|---|---|---|---|---|---|
+| 1 | 42 | 8.003 | 1.152 | **6.95x** | PASS |
+| 2 | 42 | 7.970 | 1.126 | **7.08x** | PASS |
+| 3 | 7  | 7.973 | 1.143 | **6.97x** | PASS |
+| 4 | 123| 7.982 | 1.142 | **6.99x** | PASS |
+| 5 | 999| 7.979 | 1.131 | **7.06x** | PASS |
+
+(Note: the very first launch on the server's device 0 hit an aicore timeout;
+`npu-smi` reports device 0 as `Alarm`/contended.  Re-running on a healthy
+device is consistently 6.9-7.1x with zero hangs.)
