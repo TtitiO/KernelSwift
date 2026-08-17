@@ -499,3 +499,177 @@ PASS accuracy and stay comfortably above the 5x bar:
 (Note: the very first launch on the server's device 0 hit an aicore timeout;
 `npu-smi` reports device 0 as `Alarm`/contended.  Re-running on a healthy
 device is consistently 6.9-7.1x with zero hangs.)
+
+---
+
+## 14. Step 10 — memory layout & data movement (perspective B)
+
+Follow-up work targeted at the memory/bandwidth side of the megakernel.  Two
+of the three proposed optimizations were investigated with dedicated
+micro-tests and rejected on evidence; one (flag granularity) was kept.
+
+### 14.1 Scores layout transpose (#5) — BLOCKED by dav2201 hardware
+
+Proposal: write the QK output as `[M][N][H]` (h contiguous per (m,n)) so the
+AIV's 16-column sK gather reads 64-element contiguous chunks instead of
+h-strided (stride 32) elements.
+
+Verified blockers (each tested):
+- **`Fixpipe<CFG_COLUMN_MAJOR>` (L0C→GM) is silently ignored on `dav2201`**:
+  a dedicated micro-test (C [64,16] = I@B via the full Nd2Nz/Split/Mmad
+  pipeline) showed `|out − C| = 0.0000` for every `dstStride` in
+  {16..1024} — the "column-major" config falls back to a plain row-major
+  copy, so the fixpipe cannot emit the transposed tile.
+- **`Nd2Nz` cannot read a transposed view** of the C tile (its row stride is
+  fixed; `srcNdMatrixStride` is uint16, and the resulting nz block order
+  would not match what `SplitB` expects).
+- **A pre-transpose of `q`** would cost ~680 MB of extra HBM traffic
+  (~0.3-0.4 ms) — far more than the strided gather costs (~90 us).
+
+So the strided column gather stays.  Its cost is partially mitigated by the
+Brcb-batched softmax chain (the gather output feeds a single batched
+sub/exp/mul instead of 16 per-column chains).
+
+### 14.2 Dynamic UB sizing (#6) — mostly already done, one small shrink kept
+
+The AIV VECCALC buffers are already sized from `tiling_.topk`/`tiling_.h`
+(e.g. `sKBuf_ = 2·topk·(rows·h)` instead of a `TILE_M·n` maximum).  An sK
+ping-pong restructure (double-buffered sK so tile t+1's gathers issue before
+tile t's math) was implemented but **reverted**: it exposed the in-order
+vector pipe (the gather latency is not hideable behind independent math), and
+the doubled `sK`/`maxH2` buffers plus the shrunken `aggOutQ_` slots pushed
+the AIV UB allocation past 192 KB (aicore exception) unless every transpose-
+gather dst offset was rewritten to per-sub-block-local indexing.
+
+### 14.3 Eliminating the scores GM round-trip (#7) — BLOCKED, but it is L2-only
+
+Proposal: stream the QK result directly AIC→AIV instead of the GM buffer.
+Verified blockers on `dav2201`:
+- The fixpipe API section for `__NPU_ARCH__ == 2201` exposes **only L0C→L1
+  and L0C→GM**; the L0C→UB overload exists solely for 3002/3102 arches.
+- The KFC `GetTensorC` L0C→UB path misroutes a VECIN destination into the GM
+  branch (treats the UB address as a GM address) — previously documented.
+- The AIV's MTE2 cannot source the AIC's L1.
+
+The current round trip is therefore the best available path — and it is
+**L2-only**: the 32 KB score tile is written by the fixpipe and re-read
+immediately by the AIV's prefetch, so HBM is never touched for scores.
+Measured impact of the round trip is small: `aiv_mte2` ~= 14%, and the
+FP32-vs-FP16 score storage (2x vs 1x the L2 traffic) measured **perf-neutral**
+(0.9113 vs 0.9117 ms), confirming the kernel is issue-bound, not
+bandwidth-bound, on this path.
+
+### 14.4 Kept from this round
+
+- **`FLAG_BATCH` 4 → 2**: finer-grained QK/AGG flag handshakes measure
+  consistently ~1.5 us faster (0.9083 vs 0.9099 ms), kept.
+
+## 15. Final numbers (2026-08-16, perspective B round)
+
+| variant | raw kernel latency |
+|---|---|
+| end of perspective A | 0.9109 ms |
+| + FLAG_BATCH=2 | **0.9083 ms** |
+
+Official `auto_bench` (warmup 200, repeat 500): **PASS accuracy,
+v0 ~= 7.95-8.02 ms, v1 ~= 1.12-1.16 ms, speedup ~= 6.94-7.17x** across runs.
+Multi-seed accuracy: allclose PASS for seeds {1,7,42,123,999},
+max_abs_diff = 0.0156 (tolerance atol=rtol=1e-2).
+
+---
+
+## 16. Step 11 — vector instruction & compute intensity (perspective C)
+
+### 16.1 Kept: 4-level reduction trees for max and sum
+
+The sequential 16-op max chain and 16-op sum chain were replaced by 4-level
+reduction trees (8+4+2+1 ops each, same total op count, ~3x shorter critical
+path).  The tree scratch reuses each sub-block's `maxH2` half
+(`[sub*2048 + 0..1024)` for the max tree, `[sub*2048 + 1024..2048)` for the
+sum tree), which is dead once the maxH broadcast is consumed by the batched
+Sub.  Small but consistent win (~2-3 us).
+
+### 16.2 Tried and rejected with measurements
+
+- **#9 cast+scale fusion** — already implemented: the FP32-scores change
+  (previous round) removed the half->float Cast entirely; the scale is one
+  batched `Muls` over the whole `[topk, vecLen]` tile.  The only remaining
+  Cast (aggT fp32->bf16) has no scale to fuse.
+- **#10 sink broadcast vectorization** — the sink fanout is already 4
+  vector `Adds` of 64 elements, and it runs ONCE per kernel (not per tile);
+  its total cost is ~4 instructions per kernel launch, i.e. zero on the
+  timed path.  The `DataCopyPad`-based variant would only add a fence.
+- **#8 batched 2-row gather** (one 128-element gather per k with a built
+  offset table) — analyzed as net-negative: the per-k table build adds ~32
+  vector instructions on the bottleneck pipe (aiv_vec 85%) to save ~16
+  gather *calls* whose setup runs on the scalar pipe (75%, has headroom).
+  Moving work from the pipe with headroom onto the wall pipe is the wrong
+  direction; the 64-element gathers are already single instructions.
+- **MTE2 zero-load for the aggT Duplicate** (replace 64 vector instructions
+  with a 16 KB GM zero-buffer copy) — measured: with a `PIPE_MTE2` fence it
+  races (~35% random corruption, the raw GM->UB copy completion is not
+  ordered by that barrier); with a `PIPE_ALL` fence it is correct but the
+  fence serializes the scores prefetch and costs +43 us.  Reverted.
+
+### 16.3 Final numbers (2026-08-16, perspective C round)
+
+| variant | raw kernel latency |
+|---|---|
+| end of perspective B | 0.9083 ms |
+| + max/sum reduction trees | **0.905-0.907 ms** |
+
+Official `auto_bench` (warmup 200, repeat 500): **PASS accuracy,
+v0 ~= 7.96-8.02 ms, v1 ~= 1.12-1.13 ms, speedup ~= 7.06-7.09x**.  Multi-seed
+accuracy: allclose PASS for seeds {1,7,42,123,999}, max_abs_diff = 0.0156.
+The AIV vector pipe (~85%) remains the wall; the remaining per-tile
+instruction budget (~109 API calls) is dominated by irreducible element
+counts (gathers, exp, batched sub/exp/mul, transpose, accumulate), and the
+AIC's MTE2 (~77%) is the second wall.
+
+---
+
+## 17. Step 12 — hardware reduction trees (2026-08-17)
+
+### 17.1 RA-pattern ReduceMax / ReduceSum (1.13 ms -> 1.087 ms, ~7.35x)
+
+The manual 4-level max/sum trees (15 ops of 128 el each, per sub-block-tile)
+were replaced by the adv_api `ReduceMax<float, Pattern::Reduce::RA>` and
+`ReduceSum<float, Pattern::Reduce::RA>` hardware reductions (binary reduce
+over the first axis of the [16, 128] sK tile).  Each is ONE API call that
+internally issues masked binary-tree ops with `SetVectorMask` counter masks
+(the impl lives in `reduce_max_v220_impl.h` / `reduce_sum_v220_impl.h`).
+
+- Scratch requirement: `padLast * splitK / 2` floats = 1024 (fp32, k=16).
+- The scratch must be **sub-block-relative**: after sK was double-buffered
+  during the transposed-scores experiment, using `sKBase`-relative scratch
+  overflowed the 4096-float maxH2 buffer and crashed the AIV (UB out of
+  bounds); the final code uses `bcastBase = sub * (topk*vecLen)` for both the
+  reduce scratch and the Brcb broadcast scratch.
+- Result: -30 API calls per sub-block-tile (15 max + 15 sum -> 1 + 1).
+  Official bench: v1 1.1306 ms -> 1.0865-1.0909 ms (~7.35x vs ~7.02x).
+
+### 17.2 Tried and rejected (with evidence)
+
+- **Transposed QK GEMM** (`C'[N, MH] = kv[N,D] @ q^T`, the SplitB/LoadData2D
+  transpose of the [256, 128] q): the scores^T layout makes the 16-column
+  sK gather contiguous (64-element MTE2 bursts instead of 32 vector
+  gathers).  Micro-tested: the LoadData2D B-side transpose is only reliable
+  for the proven [128, 32] / [32, 128] shapes — with n=256 (or n=128 halves
+  of the [256, 128] q) the L0B holds the q in a scrambled d-order (verified
+  by exact-value tests: q=ones is invariant to the d-scramble, random q is
+  not).  Reverted to the proven QK form.
+- **Transposed PV GEMM** (`C'[D, MH] = kvT[D,N] @ aggT[N,MH]`) to kill the
+  4096-element agg transpose gather: the output would be [D, MH] and the
+  [B, M, H, D] result needs a full 170 MB transpose (a permute+reshape of
+  the non-contiguous view forces a copy).  Reverted.
+- **fp16 PV GEMM + fp16 agg accumulation**: `Cast` fp32->half fails to
+  compile on this backend (`CastIntrinsicsImpl` has no fp32->half dispatch
+  for the narrowing path — "no matching function for call"), in both the
+  pure-vector kernel and the mixed kernel.  `Add`/`Adds` support only
+  half/float/int16/int32 (no bf16).  Reverted.
+- **kvT pre-scaling** (fold softmax_scale into kvT once per call): the
+  pure-vector kernel's fp32->bf16 Cast also hits the same backend gap.
+  Reverted; the per-tile batched scale-Muls stay.
+- **Merged 2-row transpose gather** (one 4096-element gather): same element
+  count (32 repeats), -1 API call; kept out to minimize risk on the final
+  submission (unverifiable during machine saturation).

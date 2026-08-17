@@ -42,12 +42,16 @@ struct FusedQKSoftmaxTiling {
 };
 
 // ---------------------------------------------------------------------------
-// KV transpose kernel tiling.  One work item is one batch.
+// KV transpose kernel tiling.  One work item is one batch.  The kernel also
+// emits an fp16 copy of kv (for the fp16 PV GEMM) and folds softmax_scale
+// into the transposed kvT (bf16), so the QK GEMM outputs pre-scaled scores
+// and the AIV softmax needs no per-tile scale Mul.
 // ---------------------------------------------------------------------------
 struct TransposeKvTiling {
     int32_t batchNum;  // B
     int32_t n;         // N (kv entries)
     int32_t d;         // D (head dim)
+    float   scale;     // softmax scale folded into kvT
 };
 
 // ---------------------------------------------------------------------------

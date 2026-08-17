@@ -53,6 +53,16 @@ python benchmarks/ks/auto_bench.py \
   --atol 1e-2 --rtol 1e-2 --warmup 200 --repeat 500
 ```
 
-Measured on `liteserver-4db9` (8x 910B3): **~7.1x** speedup
-(v0 ~= 7.98 ms, v1 ~= 1.12 ms, raw fused-kernel time ~0.91 ms), correctness
-PASS at `atol=rtol=1e-2` (max_abs_diff ~= 0.0156) across multiple seeds.
+Measured on `liteserver-4db9` (8x 910B3): **~7.35x** speedup
+(v0 ~= 7.96-8.05 ms, v1 ~= 1.086-1.09 ms, raw fused-kernel time ~0.83 ms),
+correctness PASS at `atol=rtol=1e-2` (max_abs_diff ~= 0.0156, seed 42).
+The latest round replaced the 15+15-op manual max/sum reduction trees with
+the hardware `ReduceMax/ReduceSum` RA-pattern reductions (one call each,
+~30 fewer AIV API calls per tile).  See `OPTIMIZATION_JOURNEY.md` for the
+memory-layout and vector-intensity investigations (scores [M][N][H] and
+transposed-scores [N][MH] GEMMs, AIC->AIV direct streaming, fp16 agg/PV and
+the batched 2-row gather are all blocked or net-negative on dav2201:
+CFG_COLUMN_MAJOR is ignored by the fixpipe, no L0C->UB path exists, the
+LoadData2D B-side transpose is unreliable for n>32, fp32->fp16 casts do not
+compile on this backend, and the offset-table build would land on the
+bottleneck vector pipe).
