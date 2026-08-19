@@ -76,4 +76,13 @@ target_compile_options(sparse_attn_ops PRIVATE
     $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=dav-2201>
 )
 
+# Kernel stub linkage differs across toolchains: the huawei bisheng build
+# exports C++-mangled kernel symbols (run_huawei.sh passes
+# -DSPARSE_ATTN_KERNEL_CXX_LINKAGE=ON); the contest server toolchain
+# exports C linkage (run.sh default -> extern "C" declarations).
+option(SPARSE_ATTN_KERNEL_CXX_LINKAGE "Declare kernel entry points with C++ linkage" OFF)
+if(SPARSE_ATTN_KERNEL_CXX_LINKAGE)
+    target_compile_definitions(sparse_attn_ops PRIVATE SPARSE_ATTN_KERNEL_CXX_LINKAGE)
+endif()
+
 message(STATUS "TORCH_LIBRARY module 'libsparse_attn_ops.so' will be built")

@@ -1,5 +1,8 @@
 #include <cmath>
 #include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include "acl/acl.h"
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
@@ -8,7 +11,10 @@
 #include "adv_api/matmul/matmul_tiling.h"
 #include "tiling/platform/platform_ascendc.h"
 
-// Kernel entry points (bisheng exports these host wrappers with C++ linkage).
+// Kernel entry points.  Linkage is toolchain-dependent: the huawei bisheng
+// build exports C++-mangled stubs (SPARSE_ATTN_KERNEL_CXX_LINKAGE, set by
+// run_huawei.sh); the contest server toolchain exports C linkage (default).
+#ifdef SPARSE_ATTN_KERNEL_CXX_LINKAGE
 void matmul_qk_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                       uint8_t *a, uint8_t *b, uint8_t *c, uint8_t *tiling);
 void matmul_pv_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
@@ -22,15 +28,34 @@ void fused_qk_softmax_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream
                              uint8_t *workspace, uint8_t *tiling);
 void transpose_kv_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                          uint8_t *kv, uint8_t *kvT, uint8_t *tiling);
-void transpose_kv_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
-                         uint8_t *kv, uint8_t *kvT, uint8_t *tiling);
 void fused_sparse_attn_basic_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                                     uint8_t *q, uint8_t *kv, uint8_t *kvT,
-                                    uint8_t *sink, uint8_t *topk,
-                                    uint8_t *scores, uint8_t *agg, uint8_t *out,
-                                    uint8_t *tiling);
+                                    uint8_t *sink, uint8_t *topk, uint8_t *scores,
+                                    uint8_t *agg, uint8_t *out, uint8_t *tiling);
+#else
+extern "C" {
+    void matmul_qk_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                          uint8_t *a, uint8_t *b, uint8_t *c, uint8_t *tiling);
+    void matmul_pv_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                          uint8_t *a, uint8_t *b, uint8_t *c, uint8_t *tiling);
+    void sparse_softmax_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                               uint8_t *scores, uint8_t *agg, uint8_t *topk,
+                               uint8_t *sink, uint8_t *tiling);
+    void fused_qk_softmax_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                                 uint8_t *q, uint8_t *kv, uint8_t *sink,
+                                 uint8_t *topk, uint8_t *scores, uint8_t *agg,
+                                 uint8_t *workspace, uint8_t *tiling);
+    void transpose_kv_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                             uint8_t *kv, uint8_t *kvT, uint8_t *tiling);
+    void fused_sparse_attn_basic_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                                        uint8_t *q, uint8_t *kv, uint8_t *kvT,
+                                        uint8_t *sink, uint8_t *topk, uint8_t *scores,
+                                        uint8_t *agg, uint8_t *out, uint8_t *tiling);
+}
+#endif
 
 namespace ascend_kernel {
+
 
 static int32_t getCubeCoreNum()
 {
@@ -228,10 +253,26 @@ static void computeFusedSparseAttnBasicTiling(FusedSparseAttnBasicTiling &t,
     t.reserved0 = 0;
 }
 
+// The tiling tensor is read by the asynchronously-launched kernel, so a
+// per-call local would be freed while the kernel is still queued/running and
+// its recycled block can be overwritten by unrelated torch ops (observed as
+// deterministic tile corruption / aivec MPU faults under torch-op churn).
+// The tiling content depends only on (shape, scale), so cache it by content:
+// allocated once, alive for the process, and the per-call H2D memcpy also
+// disappears from the timed path.
 static at::Tensor makeTilingTensor(const void *data, size_t bytes, const at::Tensor &ref)
 {
+    static std::mutex tilingMu;
+    static std::unordered_map<std::string, at::Tensor> cache;
+    std::string key(static_cast<const char *>(data), bytes);
+    std::lock_guard<std::mutex> lk(tilingMu);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
     at::Tensor t = at::empty({(int64_t)bytes}, ref.options().dtype(at::kByte));
     aclrtMemcpy(t.mutable_data_ptr(), bytes, data, bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+    cache.emplace(std::move(key), t);
     return t;
 }
 
@@ -245,10 +286,10 @@ at::Tensor sparse_attn_torch(const at::Tensor &q,
     TORCH_CHECK(kv.scalar_type() == at::kBFloat16, "kv must be bfloat16");
     TORCH_CHECK(attn_sink.scalar_type() == at::kFloat, "attn_sink must be float32");
     TORCH_CHECK(topk_idxs.scalar_type() == at::kInt, "topk_idxs must be int32");
-    TORCH_CHECK(q.is_privateuseone(), "q must be on NPU");
-    TORCH_CHECK(kv.is_privateuseone(), "kv must be on NPU");
-    TORCH_CHECK(attn_sink.is_privateuseone(), "attn_sink must be on NPU");
-    TORCH_CHECK(topk_idxs.is_privateuseone(), "topk_idxs must be on NPU");
+    TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "q must be on NPU");
+    TORCH_CHECK(kv.device().type() == c10::DeviceType::PrivateUse1, "kv must be on NPU");
+    TORCH_CHECK(attn_sink.device().type() == c10::DeviceType::PrivateUse1, "attn_sink must be on NPU");
+    TORCH_CHECK(topk_idxs.device().type() == c10::DeviceType::PrivateUse1, "topk_idxs must be on NPU");
     TORCH_CHECK(q.is_contiguous() && kv.is_contiguous() &&
                 attn_sink.is_contiguous() && topk_idxs.is_contiguous(),
                 "inputs must be contiguous");
@@ -409,10 +450,10 @@ at::Tensor sparse_attn_megakernel_basic_torch(const at::Tensor &q,
     TORCH_CHECK(kv.scalar_type() == at::kBFloat16, "kv must be bfloat16");
     TORCH_CHECK(attn_sink.scalar_type() == at::kFloat, "attn_sink must be float32");
     TORCH_CHECK(topk_idxs.scalar_type() == at::kInt, "topk_idxs must be int32");
-    TORCH_CHECK(q.is_privateuseone(), "q must be on NPU");
-    TORCH_CHECK(kv.is_privateuseone(), "kv must be on NPU");
-    TORCH_CHECK(attn_sink.is_privateuseone(), "attn_sink must be on NPU");
-    TORCH_CHECK(topk_idxs.is_privateuseone(), "topk_idxs must be on NPU");
+    TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "q must be on NPU");
+    TORCH_CHECK(kv.device().type() == c10::DeviceType::PrivateUse1, "kv must be on NPU");
+    TORCH_CHECK(attn_sink.device().type() == c10::DeviceType::PrivateUse1, "attn_sink must be on NPU");
+    TORCH_CHECK(topk_idxs.device().type() == c10::DeviceType::PrivateUse1, "topk_idxs must be on NPU");
     TORCH_CHECK(q.is_contiguous() && kv.is_contiguous() &&
                 attn_sink.is_contiguous() && topk_idxs.is_contiguous(),
                 "inputs must be contiguous");
@@ -505,7 +546,7 @@ std::vector<at::Tensor> sparse_attn_megakernel_basic_debug_torch(const at::Tenso
 at::Tensor sparse_attn_transpose_kv_torch(const at::Tensor &kv)
 {
     TORCH_CHECK(kv.scalar_type() == at::kBFloat16, "kv must be bfloat16");
-    TORCH_CHECK(kv.is_privateuseone(), "kv must be on NPU");
+    TORCH_CHECK(kv.device().type() == c10::DeviceType::PrivateUse1, "kv must be on NPU");
     TORCH_CHECK(kv.dim() == 3, "kv must be [b, n, d]");
     const int64_t B = kv.size(0);
     const int64_t N = kv.size(1);

@@ -628,6 +628,181 @@ AIC's MTE2 (~77%) is the second wall.
 
 ---
 
+## 19. Step 14 — the interleaved-call corruption hunt (2026-08-18/19, checkpoint)
+
+### 19.1 The symptom
+
+While validating step 13, a synthetic harness exposed a latent bug in the
+megakernel that the official bench never triggers: interleave the Torch
+baseline forward (or just a big fp32 `einsum`) between megakernel calls
+**without any `torch.npu.synchronize()`**, and from the second call onward
+the kernel either miscomputes a few tiles (max diff ~2.2) or, after enough
+churn, the process dies with `507035` ("vector core exception" — CCU
+instruction-address check / MPU invalid address) attributed by the runtime
+to *our* kernel (`transpose_kv_kernel`).  Both the step-12 gather build and
+the step-13 dense build show it identically, so it predates step 13.
+
+### 19.2 What was ruled out (each with an experiment)
+
+- **Megakernel cross-core flags.**  Suspected first (the AIV->AIC AGG
+  handshake sets twice per batch, the AIC waits once).  Building with **no
+  cross-core flags at all** still crashes.  Also: a *second* AIV->AIC flag
+  id (3, 4/5, 15/31, sub*16) or a second wait on the same id all **deadlock**
+  (FFTS sets coalesce onto one flag generation; the AIC wait expects both
+  sub-blocks' sets — the existing handshake is in fact balanced).
+- **Tiling-tensor lifetime.**  `makeTilingTensor` allocated the tiling
+  tensor, launched the async kernel, and freed it at op return — a real
+  use-after-free when unrelated torch ops recycle the block before the
+  queued kernel reads it.  Fixed properly (kept, see 19.3) — but the crash
+  persisted.
+- **Flag ids colliding with torch's kernels** (moved 1/2 -> 8/9): no change.
+- **Heap height / 32-bit address truncation** (24 GB pad, no einsum): clean.
+- **Input identity / cloning**: clones don't help; only interleaving matters.
+- **Memory recycling** (pin every workspace alive): still crashes.
+- **Which op triggers it**: `torch.add` and a big bf16 `torch.mm` are clean;
+  the big fp32 `einsum` and the full baseline model crash *any* of our
+  kernels (even the trivial pure-vector `transpose_kv_kernel` and the
+  non-mixed three-kernel path).  Torch-only loops are clean; megakernel-only
+  loops are clean.
+
+### 19.3 Established facts and current model
+
+- Clean under: `torch.npu.synchronize()` between ops,
+  `ASCEND_LAUNCH_BLOCKING=1`, or `TASK_QUEUE_ENABLE=0` — i.e. the fault
+  requires torch_npu's **async task queue** to be active with unsynced,
+  back-to-back heavy torch ops before our op.
+- The fault is reported on a runtime sqe (`sqe_type=ffts`) and attributed
+  to our kernel at a constant text offset across all builds — consistent
+  with an sqe/launch-config ordering violation between the host-side task
+  queue (which torch ops go through) and our raw bisheng
+  (`AscendKernelLaunchWithFlagV2`) launches (which bypass it), not with a
+  bug in our kernel code.
+- **Kept fix (real regardless):** `makeTilingTensor` now caches tiling
+  tensors in a content-keyed static map (`op_extension/sparse_attn_torch.cpp`)
+  — removes the use-after-free and, as a bonus, the per-call H2D memcpy from
+  the timed path.
+- **Status / workaround:** the official `auto_bench` never exhibits the
+  failure (its clone+compare per-iteration pattern provides enough implicit
+  ordering) and stays green (see below).  For interleaved production use,
+  syncing between foreign torch ops and this op (or `TASK_QUEUE_ENABLE=0`)
+  avoids the fault.  Remaining open root-cause thread: exactly how the
+  task-queue/direct-launch interleaving corrupts the runtime's sqe state —
+  likely a torch_npu/CANN runtime-level issue with raw-launched custom ops;
+  needs CANN support or a minimal standalone repro filed upstream.
+
+### 19.4 Bench after the tiling-cache fix
+
+The tiling-cache build (same step-13 kernel, original 1/2 flag handshake) is
+**faster than step 13**: removing the per-call `at::empty` + synchronous H2D
+memcpy (two tiling tensors) and the short-lived workspace allocations from
+the timed path shaved ~85 us of host-side overhead:
+
+| seed | v0 (ms) | v1 (ms) | speedup | result |
+|---|---|---|---|---|
+| 42 | 8.059 | 0.915 | **8.81x** | PASS |
+
+Workaround validation (fixed build): the no-sync interleave crash still
+reproduces, and both `TASK_QUEUE_ENABLE=0` and `ASCEND_LAUNCH_BLOCKING=1`
+make it disappear (6/6 clean), consistent with the launch-ordering model.
+
+---
+
+## 18. Step 13 — dense-32 masked softmax (2026-08-18)
+
+### 18.1 The idea
+
+The QK GEMM already computes all N=32 scores densely on the cube; the AIV
+then gathered the 16 selected columns into a compact sK tile.  Step 13
+eliminates the entire gather-based sparse path:
+
+- The AIV consumes the full `[128, 32]` scores tile **in place** (it is
+  already prefetched to UB) — the 32 per-tile column Gathers are deleted.
+- Duplicate semantics are restored by a **count vector** `c[r][32]` (number
+  of occurrences of j in `idx[row]`): `W = E * c * rcp` makes an index that
+  appears c times contribute c times to both the denominator and the PV
+  accumulation, and an unselected column (c=0) contributes an exact 0.
+- The row max is taken over **all 32 columns unmasked** (softmax is
+  shift-invariant; masked lanes are zeroed exactly by the count multiply;
+  with the bench data, |scaled scores| <= ~6 and sink = 0, so the shifted
+  exp cannot underflow).
+- Reductions switch from the RA pattern over `[16, 128]` to the **AR
+  pattern** (reduce the contiguous last axis) over `[128, 32]`; maxH/recip
+  fan out with the **axis-1 (last-dim) Broadcast** (Brcb + strided Copy).
+- W is already in the `[mh, n]` PV A-layout, so the aggT zero-fill, the 32
+  per-k accumulate Adds, and the `[N,H]->[H,N]` transpose Gather are all
+  deleted; one Cast writes W straight into the aggOut queue slot.
+
+### 18.2 The count-build saga (three attempts, measured)
+
+1. **Scalar read-modify-write counts** (zero 64 floats + 32 RMWs per
+   sub-block-tile on the scalar pipe): correct but ate the *entire* win —
+   a probe without any count machinery measured **0.955 ms** vs 1.053 ms
+   (gather build), while the scalar-count build measured 1.055 ms.  The
+   scalar pipe (~75% busy before) became the new wall.
+2. **Compare/Select one-hot** (static-table Gather replicating idx across
+   lanes + `Compare<int32 EQ>` + `Select`): wrong mode choice first
+   (`VSEL_CMPMASK_SPR` loads the mask *register*; the (mask, tensor, scalar)
+   overload needs `VSEL_TENSOR_SCALAR_MODE`), and the vsel/cmpmask path then
+   produced intermittent denominator-collapse corruption (~1e5 errors).
+   Abandoned.
+3. **Arithmetic one-hot (kept)**: one 1024-element Gather with a static
+   replication table, an in-place `Cast<int32->float>`, then
+   `onehot = 1 - min(|idxF - j|, 1)` as four in-place float ops (Sub, Abs,
+   Mins, Muls/Adds — note `Subs` does not exist on this backend), then two
+   `ReduceSum<RA>` over `[16, 32]`.  ~9 vector calls, zero scalar work.
+
+### 18.3 New hardware gotchas (dav2201)
+
+- **`SetFlag/WaitFlag<HardEvent::S_V>` / `<V_S>` deadlock the megakernel**
+  (hang within ~5 launches): the per-tile scalar count build could not be
+  safely fenced with cross-pipe events.  The vectorized count build avoids
+  the issue entirely; where scalar UB writes feed later vector reads
+  (PrepareSoftmax tables), the proven pattern is a one-time
+  `PipeBarrier<PIPE_ALL>`.
+- **`Select` with `VSEL_CMPMASK_SPR`** expects the cmpmask register, not a
+  UB mask tensor; the UB-mask overload requires `VSEL_TENSOR_SCALAR_MODE`.
+- **`Broadcast<float,2,1>`** (last-dim, dst `[128,32]` from src `[128,1]`)
+  works on v220 (aligned Brcb+Copy path); its tmp buffer needs
+  firstDim*8 floats for a single-loop call, and the sliced tmp tensor must
+  be an *lvalue* (rvalue slices don't bind the `LocalTensor&` parameter).
+- **`ReduceMax/ReduceSum` AR pattern** (contiguous last-axis reduce over
+  `[128, 32]`) works and needs a 1024-float scratch (fp32).
+- **Pre-existing megakernel corruption under allocator churn (not from this
+  step):** when a Torch model's forward (cube matmuls + large float
+  intermediates) is interleaved between megakernel calls *without* cloned
+  inputs, iteration 2+ of the megakernel deterministically miscomputes a
+  few tiles (~2.4 K violating elements, max diff ~2.2) — **identically on
+  the old gather build and the dense build**.  The official `auto_bench`
+  (which clones inputs per forward) never triggers it.  Root cause not yet
+  isolated (scores verified exact; suspect the AIV->AIC AGG flag protocol
+  or stale workspace reads); needs a dedicated investigation.
+
+### 18.4 Results
+
+Interleaved A/B (same device, alternating .so, v1 forward median of 500):
+
+| variant | v1 latency |
+|---|---|
+| gather build (step 12) | 1.037 / 1.052 / 1.058 / 1.076 ms |
+| dense + scalar counts | 1.055 / 1.056 ms |
+| dense, no count machinery (probe, wrong results) | 0.953 / 0.960 ms |
+| **dense + arithmetic one-hot counts (kept)** | **0.952 / 0.954 / 0.958 ms** |
+
+Official `auto_bench` (warmup 200, repeat 500, atol=rtol=1e-2):
+
+| seed | v0 (ms) | v1 (ms) | speedup | result |
+|---|---|---|---|---|
+| 42  | 8.074 | 0.996 | **8.10x** | PASS |
+| 7   | 8.058 | 1.023 | **7.88x** | PASS |
+| 123 | 8.035 | 1.018 | **7.89x** | PASS |
+
+Duplicate-index correctness verified explicitly in isolated runs:
+all-same-index (c=16), pairs (c=8), single-column (c=16) all PASS
+(max_abs_diff = 0.0156, same as the gather build).  The previous kernel is
+preserved at `op_kernel/fused_sparse_attn_basic_kernel.asc.gatherbak`.
+
+---
+
 ## 17. Step 12 — hardware reduction trees (2026-08-17)
 
 ### 17.1 RA-pattern ReduceMax / ReduceSum (1.13 ms -> 1.087 ms, ~7.35x)
