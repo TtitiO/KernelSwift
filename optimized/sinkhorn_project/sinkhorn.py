@@ -10,17 +10,20 @@ import torch_npu  # 必须导入，注册 NPU 后端
 # ---------------------------------------------------------------------------
 # 动态加载编译好的 .so 动态链接库
 # ---------------------------------------------------------------------------
-_LOADED = [False]
+_OP = None
 
 def _get_op():
-    if not _LOADED[0]:
-        # 指向通过 CMake/bash 脚本编译出来的库文件
+    global _OP
+    if _OP is None:
         _dir = os.path.dirname(os.path.abspath(__file__))
-        _so = os.path.join(_dir, "build", "libsinkhorn_ops.so") 
-        torch.ops.load_library(_so)
-        _LOADED[0] = True
-    # 返回刚才在 C++ 里注册的算子
-    return torch.ops.sinkhorn_ops.sinkhorn_kernel_basic
+        _so = os.path.join(_dir, "build", "libsinkhorn_ops.so")
+        # pybind11 直调入口（与 torch.ops 注册的是同一个自定义 kernel，开销更小）
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("sinkhorn_ext", _so)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OP = mod.sinkhorn
+    return _OP
 
 # ---------------------------------------------------------------------------
 # 赛题要求的 Model 定义 (API 不能变)
@@ -43,6 +46,10 @@ class Model(nn.Module):
         """
         # 拦截调用，导向我们无敌的 NPU 底层算子
         return _get_op()(x, self.repeat, self.eps)
+
+# auto_bench.py 要求 v1 文件导出 ModelNew（AST 过滤会丢弃别名赋值，必须用真实类定义）
+class ModelNew(Model):
+    pass
 
 # ---------------------------------------------------------------------------
 # 测试样例与初始化 (必须保留原样)
