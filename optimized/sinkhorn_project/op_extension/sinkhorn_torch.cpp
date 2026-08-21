@@ -1,9 +1,11 @@
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
-// 声明底层 Ascend C 算子（huawei bisheng 工具链导出 C++ mangled stub，不要用 extern "C"）
-void sinkhorn_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
-                     uint8_t *x, uint8_t *out, uint32_t total_matrices, uint32_t repeat, float eps);
+// 强制使用 C 链接，匹配 asc 文件里的 extern "C"
+extern "C" {
+    void sinkhorn_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                         uint8_t *x, uint8_t *out, uint32_t total_matrices, uint32_t repeat, float eps);
+}
 
 at::Tensor sinkhorn_torch(const at::Tensor &x, int64_t repeat, double eps) {
     // 1. 基本校验
