@@ -20,6 +20,7 @@ set(TORCH_NPU_LIBRARIES ${TORCH_NPU_PATH}/lib)
 # 编译 Task 02 的文件
 add_library(indexer_ops SHARED
     op_kernel/fused_indexer_qk_reduce.asc
+    op_kernel/indexer_topk.asc
     op_extension/indexer_torch.cpp
 )
 
@@ -36,3 +37,10 @@ target_compile_options(indexer_ops PRIVATE
     ${TORCH_CXX_FLAGS}
     $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=dav-2201>
 )
+
+# The huawei bisheng toolchain exports C++-mangled kernel stubs; the contest
+# server toolchain exports C linkage.  Gate the declaration in indexer_torch.cpp.
+option(INDEXER_KERNEL_CXX_LINKAGE "Declare kernel entry point with C++ linkage" OFF)
+if(INDEXER_KERNEL_CXX_LINKAGE)
+    target_compile_definitions(indexer_ops PRIVATE INDEXER_KERNEL_CXX_LINKAGE)
+endif()

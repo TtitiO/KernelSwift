@@ -1,59 +1,222 @@
-# Indexer QK-Reduce Fused Megakernel Design
+# Indexer Ascend C mixed-kernel design
 
-根据 `ascendc-operator-design` 规范，设计针对 Task 02 (Indexer) 的 `__mix__(1,2)` 混合融合算子。
+## 1. Frozen operator contract
 
-## 1. 算子需求分析与接口定义
+The reference is `baseline/indexer.py`; its constructor and `forward(x, qr,
+start_pos, offset)` signatures are frozen.
 
-*   **算子名称**: `fused_indexer_qk_reduce`
-*   **功能描述**: 融合大模型路由模块的核心打分阶段。
-    *   完成 QK GEMM: `index_score = q @ kv^T`
-    *   完成 激活、加权与归约: `out = sum_h(ReLU(index_score) * weights)`
-*   **支持的数据类型**: 输入 `bfloat16`，输出 `float32` (后续给 TopK 排序用)
-*   **输入 Shape**: 
-    *   `q`: `[B, S, H, D]` -> 视作 `[8, 41600, 64]`
-    *   `kv`: `[B, T, D]` -> `[8, 650, 64]`
-    *   `weights`: `[B, S, H]` -> 视作 `[8, 41600]`
-*   **输出 Shape**:
-    *   `out`: `[B, S, T]` -> `[8, 2600, 650]`
+For the competition case:
 
-## 2. 计算逻辑设计
+- `B=8`, `S=2600`, `dim=1024`, `H=16`, `D=64`, `rope_dim=32`;
+- `compress_ratio=4`, so the unpadded index-key length is `T=650`;
+- `index_topk=128`, BF16 projections/scores, FP32 GEMM accumulation, and INT64
+  output indices;
+- score semantics are
+  `sum_h(bf16(relu(bf16(q @ kv)) * weight_h))`, followed by the causal mask,
+  TopK, invalid-index replacement with `-1`, and `offset` addition;
+- integer outputs must match exactly. The project floating tolerance of `1e-2`
+  does not relax TopK index equality.
 
-**实现路径选择**: **AscendC Mixed Kernel `__mix__(1,2)`** (带 AIC/AIV 跨核同步)。
+## 2. Current timed path
 
-**数学公式到 AscendC API 的映射 (AIV端)**:
-AIV 获取到一个 `[32, 656]` 的 FP32 Tile (代表 2 个完整的 S Token，每个 Token 包含 H=16 行)。
-1.  **ReLU**: `Max(row_buf, row_buf, 0.0f, len)`
-2.  **Multiply Weights**: 标量乘以向量 `Muls(row_buf, row_buf, weight_scalar, len)`
-3.  **Reduce Sum (Head 维度)**: 将属于同一个 Token 的 16 行累加。
-    `Add(out_buf, out_buf, row_buf, len)`
+The wrapper uses the framework projections and KV transpose/copy. The custom
+path contains three compiled Ascend C kernels:
 
-## 3. Tiling 策略 (多级切分)
+1. `indexer_rope_kernel`: in-place BF16 RoPE with FP32 arithmetic;
+2. `fused_indexer_qk_reduce`: `__mix__(1,2)` QK GEMM, BF16 rounding, ReLU,
+   weighted head reduction, causal score masking, and BF16 score output;
+3. `indexer_topk_kernel`: exact top-128 selection over the padded score rows
+   with the baseline postprocessing (invalid index -> `-1`, `+offset`) folded
+   in, producing the final INT64 `[B,S,128]` indices.
 
-**对齐约束 (Alignment)**：
-Cube 矩阵乘法要求 N 维度是 16 的倍数。原始 T=650，必须 Padding 到 **N=656**。
+The wrapper loads `build/libindexer_ops.so` and launches all kernels on the
+current NPU stream. There is no exception or availability fallback around the
+custom calls, and no PyTorch built-in TopK/masking remains on the timed path.
 
-### 3.1 Block 级 Tiling (多核切分 - AIC)
-*   `M_total` = $2600 \times 16 = 41600$ (每 Batch)
-*   `tile_M` = 64, `tile_N` = 656, `tile_K` = 64
-*   每个 Batch 产生 $41600 / 64 = 650$ 个 Tile。
-*   共 8 个 Batch，总 Tile 数 = 5200。
-*   `blockDim = 20` (所有 20 个 AI Core 拉满)，每个 Core 处理 260 个 Tile。
+## 3. Mixed-kernel decomposition
 
-### 3.2 Sub-Block 级 Tiling (核内分工 - AIV)
-*   每个 AIC 输出一个 `[64, 656]` 的 `index_score` 中间块到 GM (由于 L2 Cache Hit，极速读写)。
-*   **AIV0** 负责处理该块的前 32 行 (对应 2 个完整的 Token)。
-*   **AIV1** 负责处理该块的后 32 行 (对应 2 个完整的 Token)。
+### AIC
 
-### 3.3 UB 分配表 (Buffer 规划，针对单个 AIV 子块)
-| Buffer 名称 | 用途 | 形状/大小 (元素数) | 预估空间 (Bytes) | 策略 |
-| :--- | :--- | :--- | :--- | :--- |
-| `in_scoresQ` | 接收 QK 结果 | `[32, 656]` FP32 | $83,968$ B | Double-buffer ($168$ KB) |
-| `weights_buf`| 存对应的头权重 | `[32]` FP32 | $128$ B | Single |
-| `out_reducedQ`| 存累加后的结果 | `[2, 656]` FP32 | $5,248$ B | Double-buffer ($10.5$ KB) |
+- One tile covers eight query tokens: `M=8*H=128`, `K=D=64`.
+- The padded key dimension is `N=672`, split into seven `N_CHUNK=96` pieces
+  (CO1 = 128x96 fp32 = 48 KB; two buffers fit L0C (<112 KB), so Mmad of
+  chunk c+1 overlaps Fixpipe of chunk c — breaking the per-chunk pipeline
+  serialization that dominated the kernel: 0.977 -> 0.854 ms).
+- AIC performs ND-to-NZ movement, L1/L0 loads, FP32 `Mmad`, and `Fixpipe` into
+  per-core GM/L2 ring slots. Each core's kvT batch operands (at most two,
+  contiguous tiles) are preloaded into L1 in NZ layout once per kernel.
+- There are `B*S/8=2600` tiles. On the measured 910B3, runtime discovery gives
+  20 Cube cores and exactly 130 tiles per core.
 
-*总 UB 使用量*：$\approx 178 \text{ KB} < 192 \text{ KB}$ (完美压线，将单核性能榨干到极致)。
+### AIV
 
-## 4. 性能优化核心考量
-1.  **消除巨型张量 HBM 流量**：原始 432MB 的中间张量 `[B,S,H,T]` 仅在片上 L2 Cache/UB 流转，直接输出 27MB 归约结果。
-2.  **极致的指令对齐**：N=656 是 16 的倍数，意味着可以使用最高效的 256Byte 宽屏向量计算，没有尾部处理开销。
-3.  **完美 AIV 负载均衡**：利用 `H=16` 的特性，AIV 切块刚好在 Token 边界，无需复杂的跨块(cross-tile)归约逻辑，全是干净的原地累加。
+- Each Cube core has two AIV sub-blocks; each AIV reduces four of the eight
+  tokens in a tile.
+- Each token consumes `[H,N]=[16,672]` FP32 score elements.
+- The baseline's BF16 rounding points are reproduced before ReLU and after
+  multiplication by the per-head BF16 weight.
+- The 16 head rows are accumulated in FP32, the causal suffix becomes `-inf`,
+  and the final `[N]` row is rounded to BF16.
+
+### Cross-core pipeline
+
+- AIC and AIV synchronize with `CrossCoreSetFlag`/`CrossCoreWaitFlag`.
+- `FLAG_BATCH=2` tiles share one signal; `NUM_SLOTS=2` creates a ring so AIC
+  can run ahead without overwriting data still consumed by AIV.
+- A/B L1 queues and AIV score/output queues are double-buffered.
+- `TPipe` is created outside the kernel classes and passed by pointer.
+
+## 4. Memory plan
+
+For one AIV at `N=672`:
+
+| Buffer | Shape/type | Bytes |
+| --- | --- | ---: |
+| score queue, two buffers | `2 * [16,672] bf16` | 43,008 |
+| FP32 work | `[16,672] fp32` | 43,008 |
+| BF16 rounding scratch | `[16,672] bf16` | 21,504 |
+| four reduced rows | `[4,672] fp32` | 10,752 |
+| output queue, two buffers | `2 * [4,672] bf16` | 10,752 |
+| weights | `[16] bf16 + [16] fp32` | 96 |
+| **Total** |  | **129,120** |
+
+This fits the runtime-reported 196,352-byte UB on the Huawei 910B3.
+
+The AIC-to-AIV workspace is a per-core double ring of **BF16** score tiles
+(the fixpipe rounds fp32->bf16 with RNE, identical to the einsum-output
+rounding the baseline applies, so numerics are unchanged; slot traffic is
+halved vs the earlier fp32 ring: megakernel 1.24 -> 1.12 ms). The full
+`[B,S,H,T]` intermediate is never materialized; only the reduced
+`[B,S,672]` BF16 tensor reaches the framework TopK.
+
+**Tiling is passed as scalar kernel arguments** (10 int32), not via a GM
+tiling tensor: reading an H2D-copied GM tiling struct proved
+context-dependent — in quiet process states the kernel read back all-zeros
+and silently no-oped (see audit 2026-08-24 evening).
+
+## 5. Exact TopK selector (`indexer_topk_kernel`)
+
+Tie semantics: measured on this NPU (probe over all-`-inf` rows, heavy
+duplicate values, causal-style rows), `torch.topk` behaves exactly like a
+**stable descending sort** — equal values (including the `-inf` blocks from
+padding/causal masking) keep ascending original index order. The advanced
+`AscendC::TopK` (v220 impl: `Sort32` + stable `MrgSort` tree, largest-first)
+reproduces that order bit-exactly, so INT64 outputs match `torch.topk`
+exactly, ties included.
+
+Kernel structure (40 AIV cores, 16 rows per `TopK` call):
+
+- batches are strided across cores (batch `bi` -> core `bi % 40`) so every
+  core sees a uniform mix of row limits; contiguous row ranges would bound
+  the kernel time by the slowest core and defeat prefix pruning;
+- valid-prefix pruning: for causal rows only the first `limit=(s+1)/ratio`
+  columns are finite; `-inf` sorts last in stable order with ascending
+  original index, so any prefix `>= max(limit, 128)` is bit-identical to
+  the full 672. Each batch runs at compile-time `inner=224` when its max
+  limit fits (average limit ~325) and `inner=672` otherwise — template
+  dispatch, because the advanced TopK is ~2.2x slower with a runtime inner.
+  The two `TopkTiling` structs (112 B = 28 int32 each) are computed once on
+  the host and passed as 56 scalar int32 kernel arguments (the launch stub
+  marshalling fails somewhere between 65 and 93 total args, so three groups
+  do not fit; a cached H2D-copied GM tiling tensor proved unreadable for
+  raw kernel launches in quiet process states — the confirmed origin of
+  no-op/507035-class failures). Tail batches are zero-padded to 16 rows and
+  their extra outputs discarded;
+- rows are loaded as BF16 (prefix columns only, strided `DataCopyPad`),
+  cast to FP32;
+- for `causal=0` the padding columns `>= actualT` are forced to `-inf`
+  (for `causal=1` the upstream megakernel already writes `-inf` there);
+- `AscendC::TopK<float>` per batch (`k=128`, `TopKMode::TOPK_NORMAL`);
+- postprocessing in INT32 vector arithmetic:
+  `out = (idx >= valid) ? -1 : idx + offset` with `valid = (s+1)/ratio`,
+  then INT32->INT64 cast and INT64 store.
+
+Key platform findings (CANN 8.5.2 / DAV_2201), which explain the earlier
+LiteTopK/TopK failures recorded in the audit:
+
+- on dav-c220 `Sort32`/`Sort` take **raw values** (no `Concat` proposal
+  packing; `Concat` is only for the v200 path);
+- `MrgSort`/`vmrgsort4` on this chip always stops a call when the **first**
+  input list drains (exhausted-suspension), so hand-rolled merge loops that
+  ignore the returned `sortedNum` counts corrupt results and/or hit UB
+  alignment exceptions (`507015`) on the unaligned continuation offsets;
+- the advanced `AscendC::TopK` implements the correct continuation
+  internally and, once buffer sizes/alignment are right, runs stably.
+
+## 6. Measured status and remaining boundary
+
+Optimization arc (official harness, median-ish fresh runs):
+
+`2.489x -> 2.768x` (custom exact TopK fusion replacing framework
+slice+topk+mask/where) `-> 2.97x` (no-op tiling bug fix: tiling passed as
+scalar kernel args; bf16 score slots) `-> 3.16x` (TILE_M=128 larger-tile
+redesign) `-> 3.26x` (TopK valid-prefix pruning + strided core load
+balance) `-> 3.58x` (N_CHUNK=96 depth-2 CO1/B2 pipeline overlapping
+Mmad/Fixpipe; CPU dispatch trims).
+
+- Exact score diagnostic (`test_repro.py`): max absolute difference `0.0`,
+  TopK agreement `1.0`.
+- Exact index diagnostic (`test_topk.py`, standalone op vs baseline-style
+  reference): INT64 equality `1.0` on 8 shape/seed cases including heavy ties,
+  `valid < 128` rows, garbage padding, and non-multiple-of-40 row counts.
+- Official harness (`auto_bench.py --warmup 20 --repeat 100`, 2026-08-25,
+  after the N_CHUNK=96 double-buffered CO1/B2 megakernel rework and CPU
+  trims):
+  `PASS accuracy; v0=6.710800 ms, v1=1.873442 ms, speedup=3.582x`,
+  `PASS accuracy; v0=6.692379 ms, v1=1.877592 ms, speedup=3.564x`,
+  `PASS accuracy; v0=6.710320 ms, v1=1.880212 ms, speedup=3.569x`.
+  Stress run (`--warmup 200 --repeat 500`):
+  `PASS accuracy; v0=6.693604 ms, v1=1.866051 ms, speedup=3.587x`.
+- Stage probe (`test_stages.py`, batched): `wq_b` 0.045, RoPE 0.170,
+  weights 0.069, KV transpose 0.060, megakernel 0.857,
+  **custom topk+mask 0.545**. Full model: 1.690 ms batched,
+  1.836 ms sync/call — consistent with the official harness.
+  CPU-side enqueue: 0.441 ms/call (down from 0.468 after removing the
+  redundant `_kvT_pad` tail `zero_()` and caching the cube-core-count acl
+  queries).
+- Bare-loop stress (`test_topk_stress.py`, 500 consecutive topk_mask
+  launches with no framework ops in between): no 507035, outputs exact.
+- Megakernel bottleneck attribution (2026-08-25): skipping the entire AIV
+  vector chain leaves the kernel at ~1.10 ms — the cost is on the AIC side.
+  AIC skip-build breakdown: fixpipe slot writes 0.29 ms, Mmad 0.13 ms,
+  Nd2Nz/SplitA/SplitB ≈ 0, residual ~0.7 ms = inter-pipe serialization
+  latency between the ~12 queue ops per tile (invariant across all
+  cross-core ring geometries — see below). Landed: per-core kvT L1 preload
+  (1.110 -> 1.090 ms).
+- Cross-core ring sweep (2026-08-25, runtime-parameterized flagBatch/
+  numSlots, kept at 2/2 defaults): (4,2)=1.103, (2,4)=1.089, (4,4)=1.100,
+  (8,2)=1.103, (8,4)=1.106, (16,2)=1.128, (2,8)=1.092, (8,8)=1.110 ms —
+  handshake count is NOT the bottleneck, disproving the flag-round-trip
+  latency theory. Deadlock root causes: the earlier FLAG_BATCH=4/NUM_SLOTS=4
+  "deadlock" was a network-timeout artifact (the combo runs fine); the
+  depth-2 CO1/B2 hang is real and consistent with L0C capacity < 112 KB
+  (2x56 KB).
+- Larger-tile redesign (2026-08-25, landed): TILE_M=128 (8 tokens/tile) with
+  N_CHUNK=224 single-buffered CO1 (112 KB — the largest chunk fitting L0C),
+  halving per-core tile count 260 -> 130 and thus the inter-pipe
+  serialization that dominates the kernel: megakernel 1.087 -> 0.977 ms,
+  bit-identical numerics (test_repro.py diff 0.0). AIV reworked to 4 tokens
+  per sub-block (UB budget 129 KB). Alternatives evaluated on paper:
+  N_CHUNK=112 (safe but ~2x more chunk ops), TILE_M=256 (CO1 exceeds L0C).
+- Harness-vs-stages gap RESOLVED (2026-08-24 evening, see audit): the gap
+  was a real megakernel correctness bug, not a scheduling slowdown. The
+  kernel read its tiling from an H2D-copied GM tensor; in quiet process
+  states (all v1-only stage tests) that read returned all-zeros, so the
+  kernel exited immediately — the 0.065 ms "fast mode" was a no-op
+  returning `at::empty` garbage. In the official harness (baseline ops run
+  first) the read worked and the kernel did its real ~1.24 ms of work.
+  Fix: tiling is now passed as scalar kernel arguments (like the rope/topk
+  kernels), making execution context-independent; score slots were also
+  switched fp32 -> bf16 (1.24 -> 1.12 ms). A new regression test
+  (`test_baseline_first.py`, baseline forward before optimized model,
+  exact INT64 equality) guards the harness-order scenario.
+
+The timed path is now fully C-like: projections and KV layout conversion are
+thin framework data movement; selection, masking, and offsetting run in the
+custom kernels. Remaining headroom: megakernel 0.857 ms (residual
+serialization now partially overlapped by the depth-2 CO1/B2 pipeline), the
+TopK kernel (0.545 ms after valid-prefix pruning; the remaining floor is
+launch/MTE2 overhead plus the `inner=672` batches), RoPE 0.170 ms (the 4-s
+block rewrite was tried and reverted: 0.170 -> 0.260 ms), and ~0.44 ms/call
+of CPU dispatch (overlapped with device work; ~0.15 ms exposed at the
+sync boundary).

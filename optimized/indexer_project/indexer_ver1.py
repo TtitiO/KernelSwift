@@ -20,6 +20,14 @@ def _get_op():
         _LOADED[0] = True
     return torch.ops.indexer_ops.fused_qk_reduce
 
+def _get_rope_op():
+    _get_op()
+    return torch.ops.indexer_ops.rope_inplace
+
+def _get_topk_op():
+    _get_op()
+    return torch.ops.indexer_ops.topk_mask
+
 # ====赛题====
 
 @dataclass
@@ -173,6 +181,10 @@ class ModelNew(torch.nn.Module):
         self.compress_ratio = compress_ratio
         self.kv_cache = kv_cache
         self.freqs_cis = freqs_cis
+        # 672 = 3 x 224: 16 对齐 (Cube Nz fractal) 且 224 分块下 L0B 双缓冲不超限
+        self.t_pad = 672
+        self._kvT_pad = None  # 惰性分配的常驻转置 padding 缓冲 [B, D, t_pad]
+        self._qlims = None    # 缓存的 query_limits [seqlen, 1]
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
         bsz, seqlen, _ = x.size()
@@ -180,45 +192,35 @@ class ModelNew(torch.nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
-        
-        # 1. 投影与位置编码 (复用 PyTorch 原生，速度极快)
+
+        # 1. 投影与位置编码 (RoPE 由自定义 AscendC 算子原地完成)
         q = self.wq_b(qr)
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        _get_rope_op()(q, freqs_cis)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        
-        # 2. Megakernel 消除 432MB 显存瓶颈
-        kv_slice = self.kv_cache[:bsz, :end_pos // ratio] # 形状: [8, 650, 64]
-        actual_t = kv_slice.shape[1]
-        
-        # 维度对齐：将 650 填充到 704 (Cube的配置)
-        pad_len = 704 - actual_t
-        assert pad_len >= 0, "T dimension exceeded megakernel limits"
-        
-        # Padding 并在转置时保证内存连续
-        kv_pad = F.pad(kv_slice, (0, 0, 0, pad_len))
-        kv_t = kv_pad.transpose(1, 2).contiguous() # [8, 64, 704]
-        
-        # 调用底层算子！返回 [8, 2600, 704] 的 float32 分数
-        reduced_scores = _get_op()(q.contiguous(), kv_t, weights.contiguous())
-        
-        # 截掉之前 Padding 的无用部分，恢复为 [8, 2600, 650]
-        # 强制转回 bfloat16！模拟 PyTorch 原生算子的低精度截断，消除 TopK 平局排序歧义
-        index_score = reduced_scores[:, :, :actual_t]
 
-        # 3. 掩码与 TopK (由于此时数据量已降到 27MB，用原生跑完全没压力)
-        if start_pos == 0:
-            mask = torch.arange(actual_t).npu().repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).npu().unsqueeze(1) // ratio
-            index_score += torch.where(mask, float("-inf"), 0)
-            
-        topk_idxs = index_score.topk(min(self.index_topk, actual_t), dim=-1)[1]
-        
-        if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1).npu().unsqueeze(1) // ratio
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-        else:
-            topk_idxs += offset
-            
+        actual_t = end_pos // ratio
+
+        # 2. 常驻转置 padding 缓冲：kv_cache [B, T, D] -> [B, D, t_pad]。
+        #    尾部恒为零（torch.zeros 分配后没有任何写入路径），且 padding 区
+        #    的分数在 causal=1 时被 megakernel 掩码为 -inf、causal=0 时被
+        #    topk kernel 强制为 -inf，因此无需每次调用再 zero_()。
+        if self._kvT_pad is None or self._kvT_pad.shape[0] < bsz:
+            self._kvT_pad = torch.zeros(
+                (bsz, self.head_dim, self.t_pad), dtype=torch.bfloat16, device=x.device)
+        self._kvT_pad[:bsz, :, :actual_t].copy_(self.kv_cache[:bsz, :actual_t].transpose(1, 2))
+
+        # 3. Megakernel: QK GEMM + ReLU + 加权头归约 + 因果掩码一步完成，
+        #    输出 bf16 [bsz, seqlen, t_pad] (精度链路与 baseline 对齐)。
+        reduced_scores = _get_op()(q, self._kvT_pad[:bsz], weights,
+                                   start_pos == 0, ratio)
+
+        # 4. 自定义 TopK 算子：精确 top-128 + 无效索引置 -1 + offset 一步完成，
+        #    输出 int64 [bsz, seqlen, min(128, actual_t)]（并列与 -inf 顺序与
+        #    torch.topk 完全一致，见 design.md）。
+        topk_idxs = _get_topk_op()(reduced_scores, start_pos == 0, ratio,
+                                   actual_t, offset)
+
         return topk_idxs
 
 # ===来自赛题
@@ -254,4 +256,3 @@ def get_init_inputs():
     freqs_cis = torch.view_as_real(freqs_cis_cpu).npu()
     kv_cache = torch.randn(args.max_batch_size, args.max_seq_len // 4, args.index_head_dim, dtype=torch.bfloat16).npu()
     return [args, freqs_cis, kv_cache, 4]
-
