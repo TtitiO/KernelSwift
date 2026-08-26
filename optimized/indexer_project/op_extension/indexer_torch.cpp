@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -9,6 +10,7 @@
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 #include "indexer_tiling.h"
+#include "indexer_topk_tiling_consts.h"
 #include "adv_api/tiling_api.h"
 #include "adv_api/kernel_tiling.h"
 #include "utils/tiling/platform/platform_ascendc.h"
@@ -17,7 +19,10 @@
 // build exports a C++-mangled stub (INDEXER_KERNEL_CXX_LINKAGE, set by
 // run.sh); the contest server toolchain exports C linkage (default).
 #ifdef INDEXER_KERNEL_CXX_LINKAGE
-extern "C" {
+// NOTE: this branch must NOT be extern "C" — the bisheng-built .asc stubs
+// are C++-mangled (verified: `nm -D` shows _Z23fused_indexer_qk_reduce...);
+// extern "C" declarations here leave the references undefined and the .so
+// fails to dlopen (upstream ecb19c2a regressed this; reverted locally).
 void fused_indexer_qk_reduce(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                              uint8_t *q, uint8_t *kvT, uint8_t *weights,
                              uint8_t *out, uint8_t *scores, int32_t totalTiles,
@@ -33,8 +38,7 @@ void indexer_topk_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                          int32_t rowsPerCore, int32_t seqlen, int32_t causal,
                          int32_t ratio, int32_t actualT, int64_t offset,
                          int32_t tt0, int32_t tt1, int32_t tt2, int32_t tt3, int32_t tt4, int32_t tt5, int32_t tt6, int32_t tt7, int32_t tt8, int32_t tt9, int32_t tt10, int32_t tt11, int32_t tt12, int32_t tt13, int32_t tt14, int32_t tt15, int32_t tt16, int32_t tt17, int32_t tt18, int32_t tt19, int32_t tt20, int32_t tt21, int32_t tt22, int32_t tt23, int32_t tt24, int32_t tt25, int32_t tt26, int32_t tt27, int32_t tt28, int32_t tt29, int32_t tt30, int32_t tt31, int32_t tt32, int32_t tt33, int32_t tt34, int32_t tt35, int32_t tt36, int32_t tt37, int32_t tt38, int32_t tt39, int32_t tt40, int32_t tt41, int32_t tt42, int32_t tt43, int32_t tt44, int32_t tt45, int32_t tt46, int32_t tt47, int32_t tt48, int32_t tt49, int32_t tt50, int32_t tt51, int32_t tt52, int32_t tt53, int32_t tt54, int32_t tt55);
-}
- #else
+#else
 extern "C" {
     void fused_indexer_qk_reduce(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                                  uint8_t *q, uint8_t *kvT, uint8_t *weights,
@@ -196,33 +200,33 @@ void indexer_rope_torch(const at::Tensor &q, const at::Tensor &freqs)
 // Exact top-128 selection over the padded score rows [B,S,672] with the
 // baseline postprocessing (invalid -> -1, +offset) folded into the kernel.
 // Returns int64 [B, S, min(128, actualT)].
-// The TopkTiling struct for a full 16-row batch (the kernel pads tail
-// batches) is computed once on the host and passed as scalar kernel args:
-// an H2D-copied GM tiling tensor proved unreadable for raw kernel launches
-// in quiet process states (see megakernel audit, 2026-08-24 evening).
-static const AscendC::tiling::TopkTiling *getTopkTilings()
+// The kernel's per-tier TopkTiling structs (outter=16, k=128, nine inner
+// tiers) are compile-time constants (see indexer_topk_tiling_consts.h):
+// passing nine structs as scalar kernel args does not fit the launch stub,
+// and an H2D-copied GM tiling tensor proved unreadable for raw kernel
+// launches in quiet process states (see megakernel audit, 2026-08-24
+// evening).  Recompute them here once per process and fail loudly on any
+// platform/toolchain drift.
+static void checkTopkTilings()
 {
-    static std::mutex mu;
-    static AscendC::tiling::TopkTiling tt[3];
-    static bool ready = false;
-    std::lock_guard<std::mutex> lk(mu);
-    if (ready) {
-        return tt;
-    }
-    auto *platform =
-        platform_ascendc::PlatformAscendCManager::GetInstance("Ascend910B3");
-    TORCH_CHECK(platform != nullptr, "platform init failed");
-    const int32_t inners[3] = {224, 448, 672};
-    for (int i = 0; i < 3; ++i) {
-        bool ok = AscendC::TopKTilingFunc(
-            *platform, inners[i], 16 /*outter*/, 128 /*k*/, 4 /*fp32*/,
-            false /*isInitIndex*/, AscendC::TopKMode::TOPK_NORMAL,
-            true /*isLargest*/, tt[i]);
-        TORCH_CHECK(ok, "TopKTilingFunc failed");
-        TORCH_CHECK(tt[i].tmpLocalSize <= 3456, "topk tmp too large");
-    }
-    ready = true;
-    return tt;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        auto *platform =
+            platform_ascendc::PlatformAscendCManager::GetInstance("Ascend910B3");
+        TORCH_CHECK(platform != nullptr, "platform init failed");
+        for (int i = 0; i < INDEXER_TOPK_TIERS; ++i) {
+            AscendC::tiling::TopkTiling tt;
+            bool ok = AscendC::TopKTilingFunc(
+                *platform, INDEXER_TOPK_INNERS[i], 16 /*outter*/, 128 /*k*/,
+                4 /*fp32*/, false /*isInitIndex*/,
+                AscendC::TopKMode::TOPK_NORMAL, true /*isLargest*/, tt);
+            TORCH_CHECK(ok, "TopKTilingFunc failed");
+            TORCH_CHECK(tt.tmpLocalSize <= 3456, "topk tmp too large");
+            TORCH_CHECK(std::memcmp(&tt, INDEXER_TOPK_TTS[i], sizeof(tt)) == 0,
+                        "hardcoded topk tiling mismatch for inner=",
+                        INDEXER_TOPK_INNERS[i]);
+        }
+    });
 }
 
 at::Tensor indexer_topk_torch(const at::Tensor &scores, bool causal,
@@ -241,11 +245,10 @@ at::Tensor indexer_topk_torch(const at::Tensor &scores, bool causal,
     int64_t totalRows = B * S;
 
     at::Tensor out = at::empty({B, S, 128}, scores.options().dtype(at::kLong));
-    const auto *tt = getTopkTilings();
-    const auto *tt2 = tt;
-    const int32_t *a = reinterpret_cast<const int32_t *>(&tt2[0]);
-    static_assert(sizeof(AscendC::tiling::TopkTiling) == 28 * sizeof(int32_t),
-                  "TopkTiling layout changed; update the arg list");
+    checkTopkTilings();
+    // The kernel ignores the 56 trailing tiling args (kept for ABI
+    // compatibility); pass the tier-0 constants for documentation value.
+    const int32_t *a = INDEXER_TOPK_TTS[0];
 
     constexpr int32_t kAivCores = 40;
     const int32_t rowsPerCore =
@@ -257,7 +260,7 @@ at::Tensor indexer_topk_torch(const at::Tensor &scores, bool causal,
                         reinterpret_cast<uint8_t *>(out.mutable_data_ptr()),
                         (int32_t)totalRows, rowsPerCore, (int32_t)S,
                         causal ? 1 : 0, (int32_t)ratio, (int32_t)actualT,
-                        offset, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[56], a[57], a[58], a[59], a[60], a[61], a[62], a[63], a[64], a[65], a[66], a[67], a[68], a[69], a[70], a[71], a[72], a[73], a[74], a[75], a[76], a[77], a[78], a[79], a[80], a[81], a[82], a[83]);
+                        offset, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27], a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25], a[26], a[27]);
     if (k < 128) {
         return out.slice(2, 0, k).contiguous();
     }
