@@ -1,65 +1,39 @@
 # Python
+__pycache__/
 *.pyc
-**/.ipynb_checkpoints/
-.pytype/
-*__pycache__*
+*.egg-info/
+.venv/
+venv/
 
-# Visual Studio files
-.env
-.vs/
-.vscode/
-*.sdf
-*.opensdf
-*.VC.opendb
-*.suo
-*.user
+# Build artifacts
+build/
+dist/
+*.whl
 
-# docs
-docs/**/build/
-docs/**/*.pdf
-docs/**/*.zip
+# Ascend/CANN build byproducts
+extra-info/
+kernel_meta/
+fusion_result.json
 
-# macOS files
+# macOS
 .DS_Store
 
-# Emacs autosaves
+# Local agent tooling (not part of the public repository)
+.agents/
+AGENTS.md
+
+# Local editor/IDE state
+.vscode/
+.env
+
+# Emacs / Vim
 *~
 \#*\#
-
-# Vim swap files
 [._]*.sw[a-p]
 
-# Source indexing files
+# Source indexing
 compile_commands.json
 .cache/clangd
 .clangd/
-
-# Pyenv files
-.python-version
-*.venv
-.venv
-venv/
-
-# Python deployment artifacts
-*.whl
-build/
-.deps/
-dist/
-dlblas/*.so
-# Archive files
-*.tar
-*.tar.*
-
-# coverage
-genhtml
-
-# cscope files
-cscope.*
 tags
-
-*egg-info
-.pytest*
-# ascend
-extra-info/
-fusion_result.json
-kernel_meta/
+cscope.*
