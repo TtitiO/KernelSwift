@@ -1,11 +1,19 @@
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
-// 强制使用 C 链接，匹配 asc 文件里的 extern "C"
+// Kernel entry point.  Linkage is toolchain-dependent: the huawei bisheng
+// build exports C++-mangled kernel stubs (SINKHORN_KERNEL_CXX_LINKAGE, set
+// by run_huawei.sh); the contest server toolchain exports C linkage
+// (run.sh default -> extern "C" declaration).
+#ifdef SINKHORN_KERNEL_CXX_LINKAGE
+void sinkhorn_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+                     uint8_t *x, uint8_t *out, uint32_t total_matrices, uint32_t repeat, float eps);
+#else
 extern "C" {
     void sinkhorn_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                          uint8_t *x, uint8_t *out, uint32_t total_matrices, uint32_t repeat, float eps);
 }
+#endif
 
 at::Tensor sinkhorn_torch(const at::Tensor &x, int64_t repeat, double eps) {
     // 1. 基本校验

@@ -1,8 +1,8 @@
 """SparseAttention — Ascend C (Cube + Vector) competition submission.
 
-Timed path: `torch.ops.npu.sparse_attn` (the compiled Ascend C kernels loaded
-from `build/libsparse_attn_ops.so`).  No PyTorch matmul/softmax/gather runs on
-the timed path.
+Timed path: `torch.ops.npu.sparse_attn_megakernel_basic` (the compiled Ascend C
+kernels loaded from `build/libsparse_attn_ops.so`).  No PyTorch
+matmul/softmax/gather runs on the timed path.
 """
 
 import os

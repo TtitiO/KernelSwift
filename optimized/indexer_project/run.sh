@@ -11,8 +11,8 @@ if [ -z "${ASCEND_HOME_PATH:-}" ]; then
 fi
 [ -n "${ASCEND_HOME_PATH:-}" ] || die "ASCEND_HOME_PATH unset"
 
-# 项目 venv 优先（含 torch/torch_npu）
-PY=/home/tinglin/wksp/KernelSwift/.venv/bin/python
+# 通过 KERNELSWIFT_PYTHON 指定含 torch/torch_npu 的 python（可选）
+PY="${KERNELSWIFT_PYTHON:-python3}"
 [ -x "$PY" ] || PY=$(which python3)
 mkdir -p build
 cd build

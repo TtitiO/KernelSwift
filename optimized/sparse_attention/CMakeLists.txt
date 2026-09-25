@@ -33,9 +33,6 @@ set(TORCH_NPU_INCLUDE_DIRS ${TORCH_NPU_PATH}/include)
 set(TORCH_NPU_LIBRARIES ${TORCH_NPU_PATH}/lib)
 
 add_library(sparse_attn_ops SHARED
-    op_kernel/matmul_kernel.asc
-    op_kernel/sparse_softmax_kernel.asc
-    op_kernel/fused_qk_softmax_kernel.asc
     op_kernel/fused_sparse_attn_basic_kernel.asc
     op_kernel/transpose_kv_kernel.asc
     op_extension/sparse_attn_torch.cpp

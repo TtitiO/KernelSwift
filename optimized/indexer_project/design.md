@@ -157,8 +157,8 @@ scalar kernel args; bf16 score slots) `-> 3.16x` (TILE_M=128 larger-tile
 redesign) `-> 3.26x` (TopK valid-prefix pruning + strided core load
 balance) `-> 3.58x` (N_CHUNK=96 depth-2 CO1/B2 pipeline overlapping
 Mmad/Fixpipe; CPU dispatch trims) `-> 3.83-3.92x` (TopK nine-tier inner
-pruning with hardcoded tiling constants; see audit 2026-08-26 for the
-rejected in-megakernel TopK fusion experiment).
+pruning with hardcoded tiling constants; an in-megakernel TopK fusion was
+tried and rejected — the sort compute, not launch overhead, dominates).
 
 - Exact score diagnostic (`test_repro.py`): max absolute difference `0.0`,
   TopK agreement `1.0`.

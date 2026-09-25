@@ -38,7 +38,6 @@ fanned out with axis-1 (last-dim) Broadcasts, and `W = E * c * rcp` restores
 the baseline duplicate-multiplicity semantics exactly (c=0 lanes contribute
 an exact 0).  The result is already in the PV A-layout, so one Cast writes it
 straight out (no zero-fill, no accumulate Adds, no transpose Gather).
-See `OPTIMIZATION_JOURNEY.md` for the full story.
 
 ## Build
 
@@ -56,14 +55,5 @@ python benchmarks/ks/auto_bench.py \
   --atol 1e-2 --rtol 1e-2 --warmup 200 --repeat 500
 ```
 
-Measured on `liteserver-4db9` (8x 910B3): **~8.8x** speedup
+Measured on an 8x Ascend 910B3 server: **~8.8x** speedup
 (v0 ~= 8.06 ms, v1 ~= 0.92 ms), correctness PASS at `atol=rtol=1e-2`.
-The latest rounds: step 13 replaced the gather-based sparse softmax with a
-**dense-32 masked softmax** (the AIV consumes the full scores tile in place,
-restores duplicate-index semantics with a vector-built count multiply, and
-writes weights straight in the PV A-layout), and step 14 fixed a latent
-host-side **tiling-tensor use-after-free** by caching the constant tiling
-tensors by content — removing the per-call H2D memcpy from the timed path.
-See `OPTIMIZATION_JOURNEY.md` for the full story and the hardware gotchas
-(including the still-open torch_npu async-launch-ordering issue that only
-triggers outside the official bench's calling pattern — §19).

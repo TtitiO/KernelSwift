@@ -3,9 +3,9 @@
 > Current design (2026-08-19): a single basic-API megakernel (QK GEMM +
 > **dense-32 masked softmax** + PV GEMM in one `__mix__(1,2)` launch), plus a
 > tiny kvT transpose kernel.  Official-bench speedup **≈ 8.8x**.
-> `OPTIMIZATION_JOURNEY.md` holds the full step-by-step history (KFC two-stage
-> → basic-API megakernel → AIV vector-pipe reductions → dense softmax); this
-> document describes only the shipped design.
+> This document describes only the shipped design; the step-by-step
+> optimization history (KFC two-stage → basic-API megakernel → AIV vector-pipe
+> reductions → dense softmax) lives in the git log.
 
 ## Contract (frozen from `baseline/sparse_attention.py`)
 
@@ -119,7 +119,7 @@ explicitly against the baseline.  (BF16 logits were tried and rejected:
 ## Result
 
 `benchmarks/ks/auto_bench.py` (warmup 200, repeat 500, `atol=rtol=1e-2`) on
-`liteserver-4db9` (8× 910B3): **PASS accuracy, speedup ≈ 8.74–8.80x**
+an 8x Ascend 910B3 server: **PASS accuracy, speedup ≈ 8.74–8.80x**
 (v0 ≈ 8.0 ms, v1 ≈ 0.914–0.919 ms), stable across seeds {7, 42, 123}.
 
 ## Known open issue (CANN runtime, not our kernel)

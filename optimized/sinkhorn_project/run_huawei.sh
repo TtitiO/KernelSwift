@@ -9,7 +9,7 @@ PY="${KERNELSWIFT_PYTHON:-python3}"
 [ -x "$PY" ] || PY=python3
 mkdir -p build
 cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="$PY" -DSPARSE_ATTN_KERNEL_CXX_LINKAGE=ON || die "cmake config failed"
+cmake .. -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="$PY" -DSINKHORN_KERNEL_CXX_LINKAGE=ON || die "cmake config failed"
 make -j8 || die "make failed"
 cd ..
-echo "built build/libsparse_attn_ops.so"
+echo "built build/libsinkhorn_ops.so successfully!"

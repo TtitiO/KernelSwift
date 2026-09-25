@@ -55,4 +55,11 @@ target_compile_options(sinkhorn_ops PRIVATE
     $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=dav-2201>
 )
 
+# The huawei bisheng toolchain exports C++-mangled kernel stubs; the contest
+# server toolchain exports C linkage.  Gate the declaration in sinkhorn_torch.cpp.
+option(SINKHORN_KERNEL_CXX_LINKAGE "Declare kernel entry point with C++ linkage" OFF)
+if(SINKHORN_KERNEL_CXX_LINKAGE)
+    target_compile_definitions(sinkhorn_ops PRIVATE SINKHORN_KERNEL_CXX_LINKAGE)
+endif()
+
 message(STATUS "TORCH_LIBRARY module 'libsinkhorn_ops.so' will be built")
