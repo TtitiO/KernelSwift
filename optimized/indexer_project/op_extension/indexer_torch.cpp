@@ -23,7 +23,6 @@
 // are C++-mangled (verified: `nm -D` shows _Z23fused_indexer_qk_reduce...);
 // extern "C" declarations here leave the references undefined and the .so
 // fails to dlopen (upstream ecb19c2a regressed this; reverted locally).
-extern "C" {
 void fused_indexer_qk_reduce(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                              uint8_t *q, uint8_t *kvT, uint8_t *weights,
                              uint8_t *out, uint8_t *scores, int32_t totalTiles,
@@ -39,8 +38,7 @@ void indexer_topk_kernel(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                          int32_t rowsPerCore, int32_t seqlen, int32_t causal,
                          int32_t ratio, int32_t actualT, int64_t offset,
                          int32_t tt0, int32_t tt1, int32_t tt2, int32_t tt3, int32_t tt4, int32_t tt5, int32_t tt6, int32_t tt7, int32_t tt8, int32_t tt9, int32_t tt10, int32_t tt11, int32_t tt12, int32_t tt13, int32_t tt14, int32_t tt15, int32_t tt16, int32_t tt17, int32_t tt18, int32_t tt19, int32_t tt20, int32_t tt21, int32_t tt22, int32_t tt23, int32_t tt24, int32_t tt25, int32_t tt26, int32_t tt27, int32_t tt28, int32_t tt29, int32_t tt30, int32_t tt31, int32_t tt32, int32_t tt33, int32_t tt34, int32_t tt35, int32_t tt36, int32_t tt37, int32_t tt38, int32_t tt39, int32_t tt40, int32_t tt41, int32_t tt42, int32_t tt43, int32_t tt44, int32_t tt45, int32_t tt46, int32_t tt47, int32_t tt48, int32_t tt49, int32_t tt50, int32_t tt51, int32_t tt52, int32_t tt53, int32_t tt54, int32_t tt55);
-}
- #else
+#else
 extern "C" {
     void fused_indexer_qk_reduce(uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
                                  uint8_t *q, uint8_t *kvT, uint8_t *weights,
